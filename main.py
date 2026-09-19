@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-ربات جنگ جهانی (World War Strategy Bot) برای تلگرام — نسخه‌ی تک‌فایلی.
-این فایل حاصل ادغام تمام ماژول‌های پروژه در یک فایل پایتونیه تا اجرا روی
-Pydroid 3 ساده‌تر باشه (فقط همین یک فایل رو باز و Run کن).
+ربات جنگ جهانی (World War Strategy Bot) برای تلگرام.
 
-نکته: توکن ربات، آیدی ادمین‌ها، شماره کارت پرداخت و کانال اخبار پایین‌تر
-در بخش «تنظیمات» همین فایل قرار دارن.
+نسخه‌ی آماده‌ی GitHub / Railway:
+- اطلاعات بازی در SQLite ذخیره می‌شود.
+- در Railway، دیتابیس روی Volume در /app/data نگه‌داری می‌شود.
+- اطلاعات محرمانه از Environment Variables خوانده می‌شوند.
 """
+import os
 import sqlite3
 import time
 import threading
@@ -17,56 +18,67 @@ import requests
 
 
 # ======================================================================
-# بخش برگرفته از: config.py
+# تنظیمات
 # ======================================================================
-# -*- coding: utf-8 -*-
-"""
-تنظیمات محرمانه ربات.
-توکن و آیدی ادمین‌ها فقط اینجا نگه‌داری می‌شن و در بقیه‌ی کد Hard-code نمی‌شن.
-"""
+# اطلاعات محرمانه را در GitHub قرار ندهید؛ این موارد از Railway Variables
+# یا متغیرهای محیطی سیستم خوانده می‌شوند.
 
-# توکن ربات تلگرام (از @BotFather تلگرام گرفته شده)
-BOT_TOKEN = "8760251210:AAF2fNsjBdPejOMaYJTTHQPjz00XAwgpfxA"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# آیدی عددی ادمین‌های اصلی بازی (می‌تونی چند نفر اضافه کنی)
-ADMIN_IDS = [7443146366, 8524573838, 5856916684]
+def _parse_admin_ids(value):
+    result = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.append(int(item))
+        except ValueError:
+            pass
+    return result
+
+ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 
 # آدرس پایه‌ی API تلگرام
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
-# آیدی کانال رسمی برای انتشار اخبار/بیانیه‌ها (اختیاری - اگر نداری خالی بذار "")
-NEWS_CHANNEL = "@worldwarrr74"
+# کانال اخبار (اختیاری)
+NEWS_CHANNEL = os.getenv("NEWS_CHANNEL", "@worldwarrr74").strip()
 
-# مسیر فایل دیتابیس (کنار همین فایل ساخته می‌شه، با ری‌استارت پاک نمی‌شه)
-DB_PATH = "warbot.db"
+# مسیر دیتابیس:
+# Railway Volume را روی /app/data مانت کنید.
+# در اجرای محلی، در صورت نبودن متغیر محیطی، warbot.db کنار برنامه ساخته می‌شود.
+DB_PATH = os.getenv("DB_PATH", "/app/data/warbot.db").strip() or "/app/data/warbot.db"
+if not os.getenv("DB_PATH") and not os.path.isdir("/app"):
+    DB_PATH = "warbot.db"
 
-# فاصله‌ی زمانی هر tick اقتصادی/تولید (ثانیه) - هر چند وقت یک‌بار درآمد/تولید محاسبه بشه
-TICK_INTERVAL_SECONDS = 900  # هر ۱۵ دقیقه
+# اطمینان از وجود پوشه‌ی دیتابیس
+_db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+if _db_dir:
+    os.makedirs(_db_dir, exist_ok=True)
+
+# فاصله‌ی زمانی هر tick اقتصادی/تولید (ثانیه)
+TICK_INTERVAL_SECONDS = 900
 
 # فاصله‌ی poll از سرور تلگرام (ثانیه)
 POLL_TIMEOUT = 20
 
 # ---------------------------------------------------------------- پرداخت‌ها
-# توکن درگاه پرداخت تلگرام برای پرداخت‌های کاربران (کشورهای VIP و پک‌ها).
-# این مقدار به‌عنوان provider_token در متد sendInvoice تلگرام فرستاده می‌شه.
-# قبل از فعال کردن خرید، توکن درگاه پرداخت تلگرام را اینجا قرار بده.
-TELEGRAM_PROVIDER_TOKEN = ""  # توکن درگاه پرداخت تلگرام؛ برای پرداخت واقعی تنظیم شود
-TELEGRAM_CURRENCY = "IRR"  # ارز فاکتور
-# شماره کارتی که وجه خریدهای کاربران (VIP/پک‌ها) دستی بهش واریز می‌شه.
-# چون تلگرام برای ریال ایران درگاه پرداخت رسمی نداره، پرداخت از این مسیر
-# به‌صورت «کارت‌به‌کارت + تایید دستی ادمین» انجام می‌شه (نه sendInvoice واقعی).
-PAYMENT_CARD_NUMBER = "6219861856566285"
-PAYMENT_CARD_HOLDER = "آمی سما"
+TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "").strip()
+TELEGRAM_CURRENCY = os.getenv("TELEGRAM_CURRENCY", "IRR").strip() or "IRR"
 
-# قیمت‌ها به تومان (خودت در همینجا قابل تغییره)
+PAYMENT_CARD_NUMBER = os.getenv("PAYMENT_CARD_NUMBER", "").strip()
+PAYMENT_CARD_HOLDER = os.getenv("PAYMENT_CARD_HOLDER", "").strip()
+
+# قیمت‌ها به تومان
 VIP_COUNTRY_PRICE_TOMAN = 30
 PACK_PRICE_TOMAN = 10
 CUSTOM_COUNTRY_PRICE_TOMAN = 20
 
-# نام کشورهایی که VIP (فقط با پرداخت پول واقعی قابل دریافت) هستن
+# نام کشورهایی که VIP هستند
 VIP_COUNTRY_NAMES = ["روسیه", "آمریکا", "چین"]
 
-# کشورهای ویژه‌ای که نقشی در بازی ندارن و فقط از طریق پنل ادمین به کسی داده می‌شن
+# کشورهای ویژه
 SPECIAL_COUNTRY_NAMES = ["مالک", "ادمین", "ادمین ۲"]
 
 
@@ -3472,7 +3484,7 @@ def process_update(update):
 def main():
     print("راه‌اندازی ربات تلگرام ...")
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("❌ BOT_TOKEN را در بخش تنظیمات فایل وارد کن.")
+        print("❌ BOT_TOKEN در Environment Variables تنظیم نشده است.")
         return
     me = get_me()
     if not me.get("ok"):
