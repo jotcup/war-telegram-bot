@@ -8,6 +8,7 @@ Pydroid 3 ساده‌تر باشه (فقط همین یک فایل رو باز و
 در بخش «تنظیمات» همین فایل قرار دارن.
 """
 import sqlite3
+import os
 import time
 import threading
 import random
@@ -37,8 +38,14 @@ TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 # آیدی کانال رسمی برای انتشار اخبار/بیانیه‌ها (اختیاری - اگر نداری خالی بذار "")
 NEWS_CHANNEL = "@worldwarrr74"
 
-# مسیر فایل دیتابیس (کنار همین فایل ساخته می‌شه، با ری‌استارت پاک نمی‌شه)
-DB_PATH = "warbot.db"
+# مسیر دیتابیس دائمی
+# روی Railway یک Volume را روی /app/data Mount کن و DB_PATH=/app/data/warbot.db بگذار.
+# در اجرای محلی/Pydroid اگر DB_PATH تنظیم نشده باشد، همان warbot.db کنار برنامه استفاده می‌شود.
+DB_PATH = os.getenv("DB_PATH", "warbot.db")
+
+# پوشه دیتابیس را در صورت نیاز خودکار می‌سازیم.
+_db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+os.makedirs(_db_dir, exist_ok=True)
 
 # فاصله‌ی زمانی هر tick اقتصادی/تولید (ثانیه) - هر چند وقت یک‌بار درآمد/تولید محاسبه بشه
 TICK_INTERVAL_SECONDS = 900  # هر ۱۵ دقیقه
@@ -88,9 +95,12 @@ _lock = threading.Lock()
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -3979,10 +3989,16 @@ def show_logs_admin(chat_id, message_id):
 
 def do_backup(chat_id, message_id):
     ts = time.strftime("%Y%m%d_%H%M%S")
-    backup_path = f"backup_{ts}.db"
+    backup_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    backup_path = os.path.join(backup_dir, f"backup_{ts}.db")
     try:
-        shutil.copy(DB_PATH, backup_path)
-        render(chat_id, message_id, f"✅ پشتیبان ذخیره شد: {backup_path}", back_kb("admin:main"))
+        with _lock:
+            dst = sqlite3.connect(backup_path)
+            try:
+                _conn.backup(dst)
+            finally:
+                dst.close()
+        render(chat_id, message_id, f"✅ پشتیبان دائمی ذخیره شد: {backup_path}", back_kb("admin:main"))
     except Exception as e:
         render(chat_id, message_id, f"⛔ خطا در پشتیبان‌گیری: {e}", back_kb("admin:main"))
 
