@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-ربات جنگ جهانی (World War Strategy Bot) برای تلگرام.
+ربات جنگ جهانی (World War Strategy Bot) برای تلگرام — نسخه‌ی تک‌فایلی.
+این فایل حاصل ادغام تمام ماژول‌های پروژه در یک فایل پایتونیه تا اجرا روی
+Pydroid 3 ساده‌تر باشه (فقط همین یک فایل رو باز و Run کن).
 
-نسخه‌ی آماده‌ی GitHub / Railway:
-- اطلاعات بازی در SQLite ذخیره می‌شود.
-- در Railway، دیتابیس روی Volume در /app/data نگه‌داری می‌شود.
-- اطلاعات محرمانه از Environment Variables خوانده می‌شوند.
+نکته: توکن ربات، آیدی ادمین‌ها، شماره کارت پرداخت و کانال اخبار پایین‌تر
+در بخش «تنظیمات» همین فایل قرار دارن.
 """
-import os
 import sqlite3
 import time
 import threading
@@ -18,67 +17,56 @@ import requests
 
 
 # ======================================================================
-# تنظیمات
+# بخش برگرفته از: config.py
 # ======================================================================
-# اطلاعات محرمانه را در GitHub قرار ندهید؛ این موارد از Railway Variables
-# یا متغیرهای محیطی سیستم خوانده می‌شوند.
+# -*- coding: utf-8 -*-
+"""
+تنظیمات محرمانه ربات.
+توکن و آیدی ادمین‌ها فقط اینجا نگه‌داری می‌شن و در بقیه‌ی کد Hard-code نمی‌شن.
+"""
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# توکن ربات تلگرام (از @BotFather تلگرام گرفته شده)
+BOT_TOKEN = "8760251210:AAF2fNsjBdPejOMaYJTTHQPjz00XAwgpfxA"
 
-def _parse_admin_ids(value):
-    result = []
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        try:
-            result.append(int(item))
-        except ValueError:
-            pass
-    return result
-
-ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+# آیدی عددی ادمین‌های اصلی بازی (می‌تونی چند نفر اضافه کنی)
+ADMIN_IDS = [7443146366, 8524573838, 5856916684]
 
 # آدرس پایه‌ی API تلگرام
 TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 
-# کانال اخبار (اختیاری)
-NEWS_CHANNEL = os.getenv("NEWS_CHANNEL", "@worldwarrr74").strip()
+# آیدی کانال رسمی برای انتشار اخبار/بیانیه‌ها (اختیاری - اگر نداری خالی بذار "")
+NEWS_CHANNEL = "@worldwarrr74"
 
-# مسیر دیتابیس:
-# Railway Volume را روی /app/data مانت کنید.
-# در اجرای محلی، در صورت نبودن متغیر محیطی، warbot.db کنار برنامه ساخته می‌شود.
-DB_PATH = os.getenv("DB_PATH", "/app/data/warbot.db").strip() or "/app/data/warbot.db"
-if not os.getenv("DB_PATH") and not os.path.isdir("/app"):
-    DB_PATH = "warbot.db"
+# مسیر فایل دیتابیس (کنار همین فایل ساخته می‌شه، با ری‌استارت پاک نمی‌شه)
+DB_PATH = "warbot.db"
 
-# اطمینان از وجود پوشه‌ی دیتابیس
-_db_dir = os.path.dirname(os.path.abspath(DB_PATH))
-if _db_dir:
-    os.makedirs(_db_dir, exist_ok=True)
-
-# فاصله‌ی زمانی هر tick اقتصادی/تولید (ثانیه)
-TICK_INTERVAL_SECONDS = 900
+# فاصله‌ی زمانی هر tick اقتصادی/تولید (ثانیه) - هر چند وقت یک‌بار درآمد/تولید محاسبه بشه
+TICK_INTERVAL_SECONDS = 900  # هر ۱۵ دقیقه
 
 # فاصله‌ی poll از سرور تلگرام (ثانیه)
 POLL_TIMEOUT = 20
 
 # ---------------------------------------------------------------- پرداخت‌ها
-TELEGRAM_PROVIDER_TOKEN = os.getenv("TELEGRAM_PROVIDER_TOKEN", "").strip()
-TELEGRAM_CURRENCY = os.getenv("TELEGRAM_CURRENCY", "IRR").strip() or "IRR"
+# توکن درگاه پرداخت تلگرام برای پرداخت‌های کاربران (کشورهای VIP و پک‌ها).
+# این مقدار به‌عنوان provider_token در متد sendInvoice تلگرام فرستاده می‌شه.
+# قبل از فعال کردن خرید، توکن درگاه پرداخت تلگرام را اینجا قرار بده.
+TELEGRAM_PROVIDER_TOKEN = ""  # توکن درگاه پرداخت تلگرام؛ برای پرداخت واقعی تنظیم شود
+TELEGRAM_CURRENCY = "IRR"  # ارز فاکتور
+# شماره کارتی که وجه خریدهای کاربران (VIP/پک‌ها) دستی بهش واریز می‌شه.
+# چون تلگرام برای ریال ایران درگاه پرداخت رسمی نداره، پرداخت از این مسیر
+# به‌صورت «کارت‌به‌کارت + تایید دستی ادمین» انجام می‌شه (نه sendInvoice واقعی).
+PAYMENT_CARD_NUMBER = "6219861856566285"
+PAYMENT_CARD_HOLDER = "آمی سما"
 
-PAYMENT_CARD_NUMBER = os.getenv("PAYMENT_CARD_NUMBER", "").strip()
-PAYMENT_CARD_HOLDER = os.getenv("PAYMENT_CARD_HOLDER", "").strip()
-
-# قیمت‌ها به تومان
+# قیمت‌ها به تومان (خودت در همینجا قابل تغییره)
 VIP_COUNTRY_PRICE_TOMAN = 30
 PACK_PRICE_TOMAN = 10
 CUSTOM_COUNTRY_PRICE_TOMAN = 20
 
-# نام کشورهایی که VIP هستند
+# نام کشورهایی که VIP (فقط با پرداخت پول واقعی قابل دریافت) هستن
 VIP_COUNTRY_NAMES = ["روسیه", "آمریکا", "چین"]
 
-# کشورهای ویژه
+# کشورهای ویژه‌ای که نقشی در بازی ندارن و فقط از طریق پنل ادمین به کسی داده می‌شن
 SPECIAL_COUNTRY_NAMES = ["مالک", "ادمین", "ادمین ۲"]
 
 
@@ -322,6 +310,62 @@ def init_db():
             amount_toman REAL,
             status TEXT DEFAULT 'awaiting_claim',
             created_at INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS un_members (
+            country_id INTEGER PRIMARY KEY,
+            joined_at INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS un_resolutions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposer_id INTEGER,
+            title TEXT,
+            description TEXT,
+            status TEXT DEFAULT 'voting',
+            created_at INTEGER,
+            closed_at INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS un_votes (
+            resolution_id INTEGER,
+            country_id INTEGER,
+            vote TEXT,
+            PRIMARY KEY (resolution_id, country_id)
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS alliances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            leader_country_id INTEGER,
+            created_at INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS alliance_members (
+            alliance_id INTEGER,
+            country_id INTEGER PRIMARY KEY,
+            joined_at INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS alliance_join_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alliance_id INTEGER,
+            country_id INTEGER,
+            status TEXT DEFAULT 'pending',
+            created_at INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS event_images (
+            category TEXT PRIMARY KEY,
+            photo TEXT,
+            updated_at INTEGER
         )""")
 
         _conn.commit()
@@ -691,6 +735,18 @@ def send_to_channel(channel, text):
     return send_message(channel, text)
 
 
+def send_photo(chat_id, photo, caption=None, reply_markup=None):
+    """
+    ارسال عکس. photo می‌تونه یک URL باشه یا یک file_id که قبلاً از یک عکس دریافتی گرفتیم.
+    """
+    body = {"chat_id": chat_id, "photo": photo}
+    if caption:
+        body["caption"] = caption[:1024]
+    if reply_markup is not None:
+        body["reply_markup"] = reply_markup
+    return _post("sendPhoto", body)
+
+
 def send_invoice(chat_id, title, description, payload, amount_rial, reply_markup=None):
     """
     ارسال درخواست پرداخت (فاکتور) تلگرام.
@@ -745,6 +801,7 @@ def main_menu_kb():
         [("📢 اخبار جهانی", "menu:news"), ("🏆 رتبه‌بندی", "menu:ranking")],
         [("📊 گزارش کشور", "menu:report"), ("⚙️ تنظیمات", "menu:settings")],
         [("🛒 فروشگاه ویژه", "menu:shop")],
+        [("🏛️ سازمان ملل", "menu:un"), ("🏰 اتحادها", "menu:alliance")],
     ])
 
 
@@ -1082,6 +1139,26 @@ def maybe_trigger_random_event():
 
 # ---------------------------------------------------------------------- اخبار
 
+EVENT_IMAGE_CATEGORIES = {
+    "destruction": "☠️ نابودی کشور",
+    "ownership_change": "🆕 تغییر مالکیت / انتخاب کشور",
+    "war_win": "🏆 پیروزی در جنگ",
+}
+
+
+def get_event_image(category):
+    row = query_one("SELECT photo FROM event_images WHERE category=?", (category,))
+    return row["photo"] if row else None
+
+
+def set_event_image(category, photo):
+    execute(
+        "INSERT INTO event_images (category, photo, updated_at) VALUES (?,?,?) "
+        "ON CONFLICT(category) DO UPDATE SET photo=?, updated_at=?",
+        (category, photo, now(), photo, now()),
+    )
+
+
 def add_news(text, category="general"):
     execute(
         "INSERT INTO news (text, category, created_at) VALUES (?,?,?)",
@@ -1089,7 +1166,11 @@ def add_news(text, category="general"):
     )
     if NEWS_CHANNEL:
         try:
-            send_to_channel(NEWS_CHANNEL, f"📢 {text}")
+            img = get_event_image(category) if category in EVENT_IMAGE_CATEGORIES else None
+            if img:
+                send_photo(NEWS_CHANNEL, img, caption=f"📢 {text}")
+            else:
+                send_to_channel(NEWS_CHANNEL, f"📢 {text}")
         except Exception as e:
             print(f"[add_news] خطا در ارسال خبر به کانال: {e}")
 
@@ -1218,10 +1299,12 @@ def end_war(war_id, winner):
         captured_count = transfer_all_territories(war["defender_id"], war["attacker_id"])
         add_news(
             f"🏆 {atk['flag']} {atk['name']} کشور {dfn['flag']} {dfn['name']} را در جنگ کاملاً نابود و اشغال کرد "
-            f"و {captured_count} منطقه را تصرف کرد."
+            f"و {captured_count} منطقه را تصرف کرد.",
+            category="war_win",
         )
         destroy_and_liberate_country(war["defender_id"])
-        add_news(f"☠️ {dfn['flag']} {dfn['name']} به کشوری آزاد و بدون مالک تبدیل شد و دوباره قابل انتخابه.")
+        add_news(f"☠️ {dfn['flag']} {dfn['name']} به کشوری آزاد و بدون مالک تبدیل شد و دوباره قابل انتخابه.",
+                 category="destruction")
     elif winner == "defender":
         execute("UPDATE countries SET wins = wins + 1, hp = max_hp * 0.5 WHERE id=?", (war["defender_id"],))
         execute("UPDATE countries SET losses = losses + 1, hp = max_hp * 0.5 WHERE id=?", (war["attacker_id"],))
@@ -1927,7 +2010,7 @@ def handle_successful_payment(chat_id, user_id, successful_payment):
         if ok:
             c = res
             apply_vip_starting_bonus(c)
-            add_news(f"💎 یک بازیکن با پرداخت VIP کنترل {c['flag']} {c['name']} را به دست گرفت.")
+            add_news(f"💎 یک بازیکن با پرداخت VIP کنترل {c['flag']} {c['name']} را به دست گرفت.", category="ownership_change")
             send_message(chat_id, f"✅ پرداخت موفق بود! کشور {c['flag']} {c['name']} در اختیار توئه.")
         else:
             send_message(chat_id, f"⚠️ پرداخت ثبت شد ولی مشکلی پیش اومد: {res}\nلطفاً به ادمین پیام بده.")
@@ -1948,7 +2031,7 @@ def handle_successful_payment(chat_id, user_id, successful_payment):
         if ok:
             c = res
             execute("UPDATE countries SET is_special=0 WHERE id=?", (country_id,))
-            add_news(f"🎨 یک بازیکن کشور اختصاصی «{c['name']}» را ساخت.")
+            add_news(f"🎨 یک بازیکن کشور اختصاصی «{c['name']}» را ساخت.", category="ownership_change")
             send_message(chat_id, f"✅ پرداخت موفق بود! کشور اختصاصی «{c['name']}» ساخته و در اختیار توئه.")
         else:
             send_message(chat_id, f"⚠️ پرداخت ثبت شد ولی مشکلی پیش اومد: {res}\nلطفاً به ادمین پیام بده.")
@@ -1971,6 +2054,253 @@ def apply_vip_starting_bonus(country):
                 "ON CONFLICT(country_id, unit_key) DO UPDATE SET quantity = quantity + ?",
                 (country["id"], unit_key, qty, qty),
             )
+
+# ======================================================================
+# بخش برگرفته از: un.py و alliance.py (سازمان ملل و اتحادها)
+# ======================================================================
+# -*- coding: utf-8 -*-
+"""سازمان ملل: عضویت، قطعنامه‌ها، رای‌گیری، برگزاری جلسه."""
+
+
+def now():
+    return int(time.time())
+
+
+def is_member(country_id):
+    row = query_one("SELECT country_id FROM un_members WHERE country_id=?", (country_id,))
+    return row is not None
+
+
+def join(country_id):
+    if is_member(country_id):
+        return False, "این کشور از قبل عضو سازمان ملله."
+    execute("INSERT INTO un_members (country_id, joined_at) VALUES (?,?)", (country_id, now()))
+    c = get_country(country_id)
+    add_news(f"🏛️ {c['flag']} {c['name']} به سازمان ملل پیوست.")
+    return True, "عضو شدی."
+
+
+def leave(country_id):
+    if not is_member(country_id):
+        return False, "عضو سازمان ملل نیستی."
+    execute("DELETE FROM un_members WHERE country_id=?", (country_id,))
+    return True, "از سازمان ملل خارج شدی."
+
+
+def list_members():
+    rows = query("SELECT country_id FROM un_members")
+    return [get_country(r["country_id"]) for r in rows]
+
+
+def member_count():
+    row = query_one("SELECT COUNT(*) n FROM un_members")
+    return row["n"] if row else 0
+
+
+def propose_resolution(country_id, title, description):
+    if not is_member(country_id):
+        return False, "برای پیشنهاد قطعنامه باید عضو سازمان ملل باشی."
+    rid = execute(
+        "INSERT INTO un_resolutions (proposer_id, title, description, status, created_at) "
+        "VALUES (?,?,?,'voting',?)",
+        (country_id, title, description, now()),
+    )
+    c = get_country(country_id)
+    add_news(f"📜 {c['flag']} {c['name']} قطعنامه‌ی «{title}» را به سازمان ملل پیشنهاد داد.")
+    return True, rid
+
+
+def list_active_resolutions():
+    return query("SELECT * FROM un_resolutions WHERE status='voting' ORDER BY id DESC")
+
+
+def list_resolutions(limit=15):
+    return query("SELECT * FROM un_resolutions ORDER BY id DESC LIMIT ?", (limit,))
+
+
+def get_resolution(rid):
+    return query_one("SELECT * FROM un_resolutions WHERE id=?", (rid,))
+
+
+def vote(resolution_id, country_id, choice):
+    if not is_member(country_id):
+        return False, "برای رای‌دادن باید عضو سازمان ملل باشی."
+    r = get_resolution(resolution_id)
+    if not r or r["status"] != "voting":
+        return False, "این قطعنامه دیگه در حال رای‌گیری نیست."
+    execute(
+        "INSERT INTO un_votes (resolution_id, country_id, vote) VALUES (?,?,?) "
+        "ON CONFLICT(resolution_id, country_id) DO UPDATE SET vote=?",
+        (resolution_id, country_id, choice, choice),
+    )
+    return True, "رایت ثبت شد."
+
+
+def vote_counts(resolution_id):
+    rows = query("SELECT vote, COUNT(*) n FROM un_votes WHERE resolution_id=? GROUP BY vote", (resolution_id,))
+    counts = {"yes": 0, "no": 0, "abstain": 0}
+    for r in rows:
+        counts[r["vote"]] = r["n"]
+    return counts
+
+
+def close_resolution(resolution_id):
+    r = get_resolution(resolution_id)
+    if not r or r["status"] != "voting":
+        return False, "این قطعنامه دیگه در حال رای‌گیری نیست."
+    counts = vote_counts(resolution_id)
+    status = "passed" if counts["yes"] > counts["no"] else "failed"
+    execute("UPDATE un_resolutions SET status=?, closed_at=? WHERE id=?", (status, now(), resolution_id))
+    verdict = "✅ تصویب شد" if status == "passed" else "❌ رد شد"
+    add_news(
+        f"📜 قطعنامه‌ی «{r['title']}» {verdict} (موافق: {counts['yes']}، مخالف: {counts['no']}، ممتنع: {counts['abstain']})."
+    )
+    return True, status
+
+
+def hold_meeting(country_id, topic):
+    if not is_member(country_id):
+        return False, "برای برگزاری جلسه باید عضو سازمان ملل باشی."
+    c = get_country(country_id)
+    add_news(f"📅 جلسه‌ی سازمان ملل با موضوع «{topic}» به درخواست {c['flag']} {c['name']} برگزار شد.")
+    return True, "جلسه اعلام شد."
+# -*- coding: utf-8 -*-
+"""اتحادها (گروه چندنفره): ساخت، عضویت، لیدری، پیام همگانی، جلسه."""
+
+
+def now():
+    return int(time.time())
+
+
+def get_alliance_of(country_id):
+    row = query_one("SELECT alliance_id FROM alliance_members WHERE country_id=?", (country_id,))
+    if not row:
+        return None
+    return query_one("SELECT * FROM alliances WHERE id=?", (row["alliance_id"],))
+
+
+def get_alliance(alliance_id):
+    return query_one("SELECT * FROM alliances WHERE id=?", (alliance_id,))
+
+
+def list_alliances():
+    return query("SELECT * FROM alliances ORDER BY id")
+
+
+def list_members(alliance_id):
+    rows = query("SELECT country_id FROM alliance_members WHERE alliance_id=?", (alliance_id,))
+    return [get_country(r["country_id"]) for r in rows]
+
+
+def is_leader(country_id, alliance_id):
+    a = get_alliance(alliance_id)
+    return bool(a and a["leader_country_id"] == country_id)
+
+
+def create_alliance(country_id, name):
+    if get_alliance_of(country_id):
+        return False, "تو همین الان عضو یک اتحادی؛ اول ازش خارج شو."
+    existing = query_one("SELECT id FROM alliances WHERE name=?", (name,))
+    if existing:
+        return False, "این اسم قبلاً برای یک اتحاد دیگه استفاده شده."
+    alliance_id = execute(
+        "INSERT INTO alliances (name, leader_country_id, created_at) VALUES (?,?,?)",
+        (name, country_id, now()),
+    )
+    execute(
+        "INSERT INTO alliance_members (alliance_id, country_id, joined_at) VALUES (?,?,?)",
+        (alliance_id, country_id, now()),
+    )
+    c = get_country(country_id)
+    add_news(f"🏰 اتحاد «{name}» به رهبری {c['flag']} {c['name']} تشکیل شد.")
+    return True, alliance_id
+
+
+def request_join(country_id, alliance_id):
+    if get_alliance_of(country_id):
+        return False, "تو همین الان عضو یک اتحادی."
+    a = get_alliance(alliance_id)
+    if not a:
+        return False, "این اتحاد پیدا نشد."
+    existing = query_one(
+        "SELECT id FROM alliance_join_requests WHERE alliance_id=? AND country_id=? AND status='pending'",
+        (alliance_id, country_id),
+    )
+    if existing:
+        return False, "قبلاً درخواست دادی و منتظر پاسخ لیدر هستی."
+    rid = execute(
+        "INSERT INTO alliance_join_requests (alliance_id, country_id, status, created_at) VALUES (?,?,'pending',?)",
+        (alliance_id, country_id, now()),
+    )
+    return True, rid
+
+
+def pending_requests_for_leader(alliance_id):
+    return query(
+        "SELECT * FROM alliance_join_requests WHERE alliance_id=? AND status='pending' ORDER BY id",
+        (alliance_id,),
+    )
+
+
+def respond_join_request(request_id, accept):
+    req = query_one("SELECT * FROM alliance_join_requests WHERE id=?", (request_id,))
+    if not req or req["status"] != "pending":
+        return False, "این درخواست دیگه معتبر نیست."
+    new_status = "accepted" if accept else "rejected"
+    execute("UPDATE alliance_join_requests SET status=? WHERE id=?", (new_status, request_id))
+    if accept:
+        if get_alliance_of(req["country_id"]):
+            return False, "این کشور همین الان عضو یک اتحاد دیگه‌ست."
+        execute(
+            "INSERT INTO alliance_members (alliance_id, country_id, joined_at) VALUES (?,?,?)",
+            (req["alliance_id"], req["country_id"], now()),
+        )
+        c = get_country(req["country_id"])
+        a = get_alliance(req["alliance_id"])
+        add_news(f"🏰 {c['flag']} {c['name']} به اتحاد «{a['name']}» پیوست.")
+    return True, new_status
+
+
+def leave_alliance(country_id):
+    a = get_alliance_of(country_id)
+    if not a:
+        return False, "تو عضو هیچ اتحادی نیستی."
+    if a["leader_country_id"] == country_id:
+        # لیدر که بره، کل اتحاد منحل می‌شه
+        execute("DELETE FROM alliance_members WHERE alliance_id=?", (a["id"],))
+        execute("DELETE FROM alliance_join_requests WHERE alliance_id=?", (a["id"],))
+        execute("DELETE FROM alliances WHERE id=?", (a["id"],))
+        add_news(f"🏰 اتحاد «{a['name']}» به دلیل خروج لیدر منحل شد.")
+        return True, "اتحاد منحل شد (چون تو لیدر بودی)."
+    execute("DELETE FROM alliance_members WHERE country_id=?", (country_id,))
+    return True, "از اتحاد خارج شدی."
+
+
+def broadcast_to_alliance(leader_country_id, text):
+    a = get_alliance_of(leader_country_id)
+    if not a or not is_leader(leader_country_id, a["id"]):
+        return False, "فقط لیدر اتحاد می‌تونه پیام همگانی بده."
+    members = list_members(a["id"])
+    sent = 0
+    for m in members:
+        if m["id"] == leader_country_id:
+            continue
+        if m["owner_id"]:
+            try:
+                send_message(m["owner_id"], f"📢 <b>پیام لیدر اتحاد «{a['name']}»</b>\n\n{text}")
+                sent += 1
+            except Exception:
+                pass
+    return True, sent
+
+
+def hold_alliance_meeting(leader_country_id, topic):
+    a = get_alliance_of(leader_country_id)
+    if not a or not is_leader(leader_country_id, a["id"]):
+        return False, "فقط لیدر اتحاد می‌تونه جلسه برگزار کنه."
+    ok, sent = broadcast_to_alliance(leader_country_id, f"📅 جلسه‌ی اتحاد با موضوع «{topic}» تشکیل شد.")
+    add_news(f"📅 اتحاد «{a['name']}» جلسه‌ای با موضوع «{topic}» برگزار کرد.")
+    return True, sent
 
 # ======================================================================
 # بخش برگرفته از: handlers.py
@@ -2098,7 +2428,7 @@ def do_select_country(chat_id, message_id, user_id, username, country_id):
         render(chat_id, message_id, f"⛔ {res}", country_list_kb(0))
         return
     c = res
-    add_news(f"🆕 یک بازیکن جدید کنترل {c['flag']} {c['name']} را به دست گرفت.")
+    add_news(f"🆕 یک بازیکن جدید کنترل {c['flag']} {c['name']} را به دست گرفت.", category="ownership_change")
     render(chat_id, message_id, f"✅ تبریک! تو حالا رهبر {c['flag']} {c['name']} هستی.", main_menu_kb())
 
 
@@ -2773,6 +3103,245 @@ def show_settings(chat_id, message_id, user_id):
 
 # -------------------------------------------------------------------- فروشگاه
 
+# -------------------------------------------------------------- سازمان ملل
+
+def show_un_menu(chat_id, message_id, user_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    member = is_member(c["id"])
+    lines = [
+        "🏛️ <b>سازمان ملل</b>",
+        f"تعداد اعضا: {member_count()}",
+        f"وضعیت تو: {'✅ عضو هستی' if member else '❌ عضو نیستی'}\n",
+    ]
+    rows = []
+    if not member:
+        rows.append([("🚪 عضویت در سازمان ملل", "un:join")])
+    else:
+        rows.append([("📜 پیشنهاد قطعنامه", "un:propose"), ("📅 برگزاری جلسه", "un:meeting")])
+    active = list_active_resolutions()
+    if active:
+        lines.append("📜 <b>قطعنامه‌های در حال رای‌گیری:</b>")
+        for r in active:
+            counts = vote_counts(r["id"])
+            lines.append(f"#{r['id']} «{r['title']}» — 👍{counts['yes']} 👎{counts['no']} 🤷{counts['abstain']}")
+            if member:
+                rows.append([
+                    (f"👍 #{r['id']}", f"un:vote:{r['id']}:yes"),
+                    (f"👎 #{r['id']}", f"un:vote:{r['id']}:no"),
+                    (f"🤷 #{r['id']}", f"un:vote:{r['id']}:abstain"),
+                ])
+            if r["proposer_id"] == c["id"]:
+                rows.append([(f"🔚 پایان رای‌گیری #{r['id']}", f"un:close:{r['id']}")])
+    else:
+        lines.append("فعلاً قطعنامه‌ی در حال رای‌گیری‌ای نیست.")
+    rows.append([("🔙 بازگشت", "menu:main")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows))
+
+
+def do_un_join(chat_id, message_id, user_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = join(c["id"])
+    show_un_menu(chat_id, message_id, user_id)
+    if not ok:
+        send_message(chat_id, f"⛔ {res}")
+
+
+def ask_un_propose(chat_id, message_id, user_id):
+    AWAITING[user_id] = {"action": "un_propose", "chat_id": chat_id}
+    render(chat_id, message_id,
+           "📜 عنوان قطعنامه رو بفرست. اگه خواستی توضیح هم بدی، بعد از یک «|» بنویس.\n"
+           "مثال: افزایش تعرفه‌ی نفت | برای تثبیت بازار جهانی",
+           back_kb("menu:un"))
+
+
+def do_un_propose(chat_id, user_id, text):
+    c = require_country(user_id)
+    if not c:
+        return
+    if "|" in text:
+        title, desc = text.split("|", 1)
+    else:
+        title, desc = text, ""
+    title = title.strip()[:80]
+    ok, res = propose_resolution(c["id"], title, desc.strip())
+    if ok:
+        send_message(chat_id, "✅ قطعنامه ثبت شد و رای‌گیری شروع شد.")
+    else:
+        send_message(chat_id, f"⛔ {res}")
+
+
+def ask_un_meeting(chat_id, message_id, user_id):
+    AWAITING[user_id] = {"action": "un_meeting", "chat_id": chat_id}
+    render(chat_id, message_id, "📅 موضوع جلسه‌ی سازمان ملل رو بفرست.", back_kb("menu:un"))
+
+
+def do_un_meeting(chat_id, user_id, topic):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = hold_meeting(c["id"], topic.strip()[:100])
+    send_message(chat_id, "✅ جلسه اعلام شد." if ok else f"⛔ {res}")
+
+
+def do_un_vote(chat_id, message_id, user_id, resolution_id, choice):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = vote(resolution_id, c["id"], choice)
+    show_un_menu(chat_id, message_id, user_id)
+    if not ok:
+        send_message(chat_id, f"⛔ {res}")
+
+
+def do_un_close(chat_id, message_id, user_id, resolution_id):
+    c = require_country(user_id)
+    r = get_resolution(resolution_id)
+    if not c or not r or r["proposer_id"] != c["id"]:
+        return
+    close_resolution(resolution_id)
+    show_un_menu(chat_id, message_id, user_id)
+
+
+# ------------------------------------------------------------------ اتحادها
+
+def show_alliance_menu(chat_id, message_id, user_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    a = get_alliance_of(c["id"])
+    if a:
+        members = list_members(a["id"])
+        is_leader = a["leader_country_id"] == c["id"]
+        lines = [f"🏰 <b>اتحاد «{a['name']}»</b>"]
+        leader_c = get_country(a["leader_country_id"])
+        lines.append(f"👑 لیدر: {leader_c['flag']} {leader_c['name']}")
+        lines.append(f"👥 اعضا ({len(members)}):")
+        for m in members:
+            lines.append(f"  {m['flag']} {m['name']}")
+        rows = []
+        if is_leader:
+            rows.append([("📢 پیام همگانی", "alliance:broadcast"), ("📅 برگزاری جلسه", "alliance:meeting")])
+            pending = pending_requests_for_leader(a["id"])
+            if pending:
+                rows.append([(f"📋 درخواست‌های عضویت ({len(pending)})", "alliance:requests")])
+        rows.append([("🚪 ترک اتحاد", "alliance:leave")])
+        rows.append([("🔙 بازگشت", "menu:main")])
+        render(chat_id, message_id, "\n".join(lines), kb(rows))
+    else:
+        alliances = list_alliances()
+        lines = ["🏰 <b>اتحادها</b>\nتو عضو هیچ اتحادی نیستی.\n"]
+        rows = [[("➕ ساخت اتحاد جدید", "alliance:create")]]
+        if alliances:
+            lines.append("اتحادهای موجود:")
+            for al in alliances:
+                leader_c = get_country(al["leader_country_id"])
+                member_n = len(list_members(al["id"]))
+                lines.append(f"«{al['name']}» — لیدر: {leader_c['flag']} {leader_c['name']} ({member_n} عضو)")
+                rows.append([(f"🚪 درخواست عضویت در «{al['name']}»", f"alliance:join:{al['id']}")])
+        rows.append([("🔙 بازگشت", "menu:main")])
+        render(chat_id, message_id, "\n".join(lines), kb(rows))
+
+
+def ask_alliance_create(chat_id, message_id, user_id):
+    AWAITING[user_id] = {"action": "alliance_create", "chat_id": chat_id}
+    render(chat_id, message_id, "🏰 اسم اتحادت رو بفرست (حداکثر ۳۰ کاراکتر).", back_kb("menu:alliance"))
+
+
+def do_alliance_create(chat_id, user_id, name):
+    c = require_country(user_id)
+    if not c:
+        return
+    name = name.strip()
+    if not name or len(name) > 30 or ":" in name:
+        send_message(chat_id, "❗ اسم نامعتبره. دوباره امتحان کن یا /cancel بزن.")
+        AWAITING[user_id] = {"action": "alliance_create", "chat_id": chat_id}
+        return
+    ok, res = create_alliance(c["id"], name)
+    AWAITING.pop(user_id, None)
+    send_message(chat_id, f"✅ اتحاد «{name}» ساخته شد و لیدرش تو هستی!" if ok else f"⛔ {res}")
+
+
+def do_alliance_join_request(chat_id, message_id, user_id, alliance_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = request_join(c["id"], alliance_id)
+    text = "✅ درخواست عضویت ارسال شد؛ منتظر تایید لیدر باش." if ok else f"⛔ {res}"
+    render(chat_id, message_id, text, back_kb("menu:alliance"))
+
+
+def show_alliance_requests(chat_id, message_id, user_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    a = get_alliance_of(c["id"])
+    if not a or a["leader_country_id"] != c["id"]:
+        return
+    pending = pending_requests_for_leader(a["id"])
+    lines = ["📋 <b>درخواست‌های عضویت</b>\n"]
+    rows = []
+    for p in pending:
+        pc = get_country(p["country_id"])
+        lines.append(f"{pc['flag']} {pc['name']}")
+        rows.append([
+            (f"✅ قبول {pc['name']}", f"alliance:reqresp:{p['id']}:1"),
+            (f"❌ رد {pc['name']}", f"alliance:reqresp:{p['id']}:0"),
+        ])
+    if not pending:
+        lines.append("درخواستی در انتظار نیست.")
+    rows.append([("🔙 بازگشت", "menu:alliance")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows))
+
+
+def do_alliance_request_response(chat_id, message_id, user_id, request_id, accept):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = respond_join_request(request_id, bool(accept))
+    show_alliance_requests(chat_id, message_id, user_id)
+    if not ok:
+        send_message(chat_id, f"⛔ {res}")
+
+
+def do_alliance_leave(chat_id, message_id, user_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = leave_alliance(c["id"])
+    render(chat_id, message_id, res, back_kb("menu:main"))
+
+
+def ask_alliance_broadcast(chat_id, message_id, user_id):
+    AWAITING[user_id] = {"action": "alliance_broadcast", "chat_id": chat_id}
+    render(chat_id, message_id, "📢 متن پیام همگانی برای اعضای اتحادت رو بفرست.", back_kb("menu:alliance"))
+
+
+def do_alliance_broadcast(chat_id, user_id, text):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = broadcast_to_alliance(c["id"], text)
+    send_message(chat_id, f"✅ پیام برای {res} عضو ارسال شد." if ok else f"⛔ {res}")
+
+
+def ask_alliance_meeting(chat_id, message_id, user_id):
+    AWAITING[user_id] = {"action": "alliance_meeting", "chat_id": chat_id}
+    render(chat_id, message_id, "📅 موضوع جلسه‌ی اتحاد رو بفرست.", back_kb("menu:alliance"))
+
+
+def do_alliance_meeting(chat_id, user_id, topic):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = hold_alliance_meeting(c["id"], topic.strip()[:100])
+    send_message(chat_id, "✅ جلسه اعلام شد." if ok else f"⛔ {res}")
+
+
+
 def pack_contents_text(pack):
     """توضیح محتوای یک پک به‌صورت متن خوانا، مثلاً 'سرباز x100، تانک اصلی x8'."""
     if "units" in pack:
@@ -2822,7 +3391,7 @@ def do_custom_country_name(chat_id, user_id, name):
     ok, res = create_and_assign_custom_country(name, user_id)
     if ok:
         c = res
-        add_news(f"🎨 یک بازیکن کشور اختصاصی «{c['name']}» را ساخت.")
+        add_news(f"🎨 یک بازیکن کشور اختصاصی «{c['name']}» را ساخت.", category="ownership_change")
         send_message(chat_id, f"✅ کشور اختصاصی «{c['name']}» ساخته شد و از همین الان مال توئه!")
         send_main_menu(chat_id, c)
     else:
@@ -2952,8 +3521,44 @@ def handle_callback(chat_id, message_id, user_id, username, cb_data, callback_id
         claim_manual_payment(chat_id, user_id, int(parts[1]))
     elif cb_data == "customcountry:new":
         ask_custom_country_name(chat_id, message_id, user_id)
+    elif cb_data == "menu:un":
+        show_un_menu(chat_id, message_id, user_id)
+    elif cb_data == "un:join":
+        do_un_join(chat_id, message_id, user_id)
+    elif cb_data == "un:propose":
+        ask_un_propose(chat_id, message_id, user_id)
+    elif cb_data == "un:meeting":
+        ask_un_meeting(chat_id, message_id, user_id)
+    elif action == "un" and parts[1] == "vote":
+        do_un_vote(chat_id, message_id, user_id, int(parts[2]), parts[3])
+    elif action == "un" and parts[1] == "close":
+        do_un_close(chat_id, message_id, user_id, int(parts[2]))
+    elif cb_data == "menu:alliance":
+        show_alliance_menu(chat_id, message_id, user_id)
+    elif cb_data == "alliance:create":
+        ask_alliance_create(chat_id, message_id, user_id)
+    elif action == "alliance" and parts[1] == "join":
+        do_alliance_join_request(chat_id, message_id, user_id, int(parts[2]))
+    elif cb_data == "alliance:requests":
+        show_alliance_requests(chat_id, message_id, user_id)
+    elif action == "alliance" and parts[1] == "reqresp":
+        do_alliance_request_response(chat_id, message_id, user_id, int(parts[2]), int(parts[3]))
+    elif cb_data == "alliance:leave":
+        do_alliance_leave(chat_id, message_id, user_id)
+    elif cb_data == "alliance:broadcast":
+        ask_alliance_broadcast(chat_id, message_id, user_id)
+    elif cb_data == "alliance:meeting":
+        ask_alliance_meeting(chat_id, message_id, user_id)
     else:
         pass
+
+
+def handle_photo(chat_id, user_id, username, file_id):
+    ensure_user(user_id, username)
+    pending = AWAITING.get(user_id)
+    if pending and pending.get("action") == "admin_set_event_image":
+        handle_admin_photo(chat_id, user_id, pending, file_id)
+        AWAITING.pop(user_id, None)
 
 
 def handle_text(chat_id, user_id, username, text):
@@ -3019,13 +3624,23 @@ def handle_text(chat_id, user_id, username, text):
             do_publish_statement(chat_id, user_id, text)
         elif action == "custom_country_name":
             do_custom_country_name(chat_id, user_id, text)
+        elif action == "un_propose":
+            do_un_propose(chat_id, user_id, text)
+        elif action == "un_meeting":
+            do_un_meeting(chat_id, user_id, text)
+        elif action == "alliance_create":
+            do_alliance_create(chat_id, user_id, text)
+        elif action == "alliance_broadcast":
+            do_alliance_broadcast(chat_id, user_id, text)
+        elif action == "alliance_meeting":
+            do_alliance_meeting(chat_id, user_id, text)
         elif action.startswith("admin_"):
             handle_admin_text(chat_id, user_id, action, pending, text)
     except ValueError:
         send_message(chat_id, "❗ لطفاً یک عدد معتبر بفرست (یا /cancel برای انصراف).")
         return
     finally:
-        self_managed = action.startswith("admin_") or action == "custom_country_name"
+        self_managed = action.startswith("admin_") or action in ("custom_country_name", "alliance_create")
         if user_id in AWAITING and not self_managed:
             AWAITING.pop(user_id, None)
         elif action.startswith("admin_"):
@@ -3054,6 +3669,7 @@ def send_admin_panel(chat_id, message_id=None):
         [("🎲 رویداد جهانی", "admin:event"), ("📊 آمار بازی", "admin:stats")],
         [("📜 لاگ فعالیت‌ها", "admin:logs"), ("💾 پشتیبان دیتابیس", "admin:backup")],
         [("🎖️ کشورهای ویژه (مالک/ادمین)", "admin:special")],
+        [("🖼️ عکس رویدادها", "admin:eventimages")],
         [("🔄 ریست فصل", "admin:resetseason")],
         [("🔙 بازگشت به بازی", "menu:main")],
     ]
@@ -3156,6 +3772,15 @@ def handle_admin_callback(chat_id, message_id, user_id, cb_data):
         do_backup(chat_id, message_id)
     elif sub == "special":
         show_special_countries_admin(chat_id, message_id)
+    elif sub == "eventimages":
+        show_event_images_admin(chat_id, message_id)
+    elif sub == "setimg":
+        category = parts[2]
+        AWAITING[user_id] = {"action": "admin_set_event_image", "category": category, "chat_id": chat_id}
+        render(chat_id, message_id,
+                 f"یک عکس بفرست یا لینک (URL) عکس رو بفرست که برای «{EVENT_IMAGE_CATEGORIES[category]}» استفاده بشه.\n"
+                 "برای پاک‌کردن عکس فعلی، کلمه‌ی «حذف» رو بفرست.",
+                 back_kb("admin:eventimages"))
     elif sub == "payapprove":
         approve_manual_payment(chat_id, int(parts[2]))
     elif sub == "payreject":
@@ -3169,6 +3794,26 @@ def handle_admin_callback(chat_id, message_id, user_id, cb_data):
         render(chat_id, message_id, "✅ فصل جدید شروع شد.", back_kb("admin:main"))
     else:
         send_admin_panel(chat_id, message_id)
+
+
+def show_event_images_admin(chat_id, message_id):
+    lines = ["🖼️ <b>عکس رویدادها</b>\nبرای هر دسته می‌تونی یک عکس تنظیم کنی که همراه خبر مربوطه تو کانال فرستاده بشه.\n"]
+    rows = []
+    for cat, label in EVENT_IMAGE_CATEGORIES.items():
+        current = get_event_image(cat)
+        status = "✅ تنظیم شده" if current else "❌ تنظیم نشده"
+        lines.append(f"{label}: {status}")
+        rows.append([(f"🖼️ {label}", f"admin:setimg:{cat}")])
+    rows.append([("🔙 بازگشت", "admin:main")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows))
+
+
+def handle_admin_photo(chat_id, user_id, pending, file_id):
+    category = pending.get("category")
+    if not category or category not in EVENT_IMAGE_CATEGORIES:
+        return
+    set_event_image(category, file_id)
+    send_message(chat_id, f"✅ عکس برای «{EVENT_IMAGE_CATEGORIES[category]}» ذخیره شد.")
 
 
 def show_special_countries_admin(chat_id, message_id):
@@ -3363,7 +4008,15 @@ def do_reset_season():
 def handle_admin_text(chat_id, user_id, action, pending, text):
     cid = pending.get("country_id")
     try:
-        if action == "admin_transfer":
+        if action == "admin_set_event_image":
+            category = pending.get("category")
+            if text.strip() in ("حذف", "/حذف", "delete"):
+                set_event_image(category, None)
+                send_message(chat_id, "✅ عکس حذف شد.")
+            else:
+                set_event_image(category, text.strip())
+                send_message(chat_id, f"✅ عکس برای «{EVENT_IMAGE_CATEGORIES[category]}» ذخیره شد.")
+        elif action == "admin_transfer":
             new_owner = int(text)
             execute("UPDATE countries SET owner_id=? WHERE id=?", (new_owner, cid))
             execute("UPDATE users SET country_id=? WHERE user_id=?", (cid, new_owner))
@@ -3473,6 +4126,10 @@ def process_update(update):
             if msg.get("successful_payment"):
                 handle_successful_payment(chat_id, user_id, msg["successful_payment"])
                 return
+            if msg.get("photo"):
+                file_id = msg["photo"][-1]["file_id"]
+                handle_photo(chat_id, user_id, username, file_id)
+                return
             text = msg.get("text", "")
             if text:
                 handle_text(chat_id, user_id, username, text)
@@ -3484,7 +4141,7 @@ def process_update(update):
 def main():
     print("راه‌اندازی ربات تلگرام ...")
     if not BOT_TOKEN or BOT_TOKEN == "PUT_YOUR_TELEGRAM_BOT_TOKEN_HERE":
-        print("❌ BOT_TOKEN در Environment Variables تنظیم نشده است.")
+        print("❌ BOT_TOKEN را در بخش تنظیمات فایل وارد کن.")
         return
     me = get_me()
     if not me.get("ok"):
