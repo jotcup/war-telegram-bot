@@ -8,13 +8,14 @@ Pydroid 3 ساده‌تر باشه (فقط همین یک فایل رو باز و
 در بخش «تنظیمات» همین فایل قرار دارن.
 """
 import sqlite3
-import os
 import time
 import threading
 import random
 import shutil
 import traceback
 import requests
+import os
+import json
 
 
 # ======================================================================
@@ -38,14 +39,31 @@ TELEGRAM_API_BASE = "https://api.telegram.org/bot{token}/{method}"
 # آیدی کانال رسمی برای انتشار اخبار/بیانیه‌ها (اختیاری - اگر نداری خالی بذار "")
 NEWS_CHANNEL = "@worldwarrr74"
 
-# مسیر دیتابیس دائمی
-# روی Railway یک Volume را روی /app/data Mount کن و DB_PATH=/app/data/warbot.db بگذار.
-# در اجرای محلی/Pydroid اگر DB_PATH تنظیم نشده باشد، همان warbot.db کنار برنامه استفاده می‌شود.
-DB_PATH = os.getenv("DB_PATH", "warbot.db")
+# مسیر فایل دیتابیس (کنار همین فایل ساخته می‌شه، با ری‌استارت پاک نمی‌شه)
+# Railway persistent database path.
+# Mount a Railway Volume at /app/data and set DB_PATH=/app/data/warbot.db.
+# One-time migration: if an old local warbot.db exists and the persistent DB
+# does not exist yet, copy the old database into the Volume before connecting.
+DB_PATH = os.getenv("DB_PATH", "/app/data/warbot.db")
 
-# پوشه دیتابیس را در صورت نیاز خودکار می‌سازیم.
 _db_dir = os.path.dirname(os.path.abspath(DB_PATH))
 os.makedirs(_db_dir, exist_ok=True)
+
+_legacy_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "warbot.db")
+if (
+    os.path.abspath(_legacy_db) != os.path.abspath(DB_PATH)
+    and os.path.exists(_legacy_db)
+    and not os.path.exists(DB_PATH)
+):
+    try:
+        shutil.copy2(_legacy_db, DB_PATH)
+        print(f"[DB] Migrated existing database to persistent path: {DB_PATH}")
+    except Exception as e:
+        print(f"[DB] Migration warning: {e}")
+
+# پوشه‌ی عکس‌های پیش‌فرض بخش‌های بازی (کنار همین فایل، پوشه‌ی assets).
+# اگه ادمین برای یک بخش عکس دستی تنظیم نکرده باشه، همین عکس‌های پیش‌فرض استفاده می‌شن.
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 
 # فاصله‌ی زمانی هر tick اقتصادی/تولید (ثانیه) - هر چند وقت یک‌بار درآمد/تولید محاسبه بشه
 TICK_INTERVAL_SECONDS = 900  # هر ۱۵ دقیقه
@@ -188,7 +206,8 @@ def init_db():
             economic_value REAL,
             strategic_value INTEGER DEFAULT 1,
             is_strait INTEGER DEFAULT 0,
-            strait_bonus REAL DEFAULT 0
+            strait_bonus REAL DEFAULT 0,
+            is_closed INTEGER DEFAULT 0
         )""")
 
         c.execute("""
@@ -300,6 +319,54 @@ def init_db():
         )""")
 
         c.execute("""
+        CREATE TABLE IF NOT EXISTS sports (
+            country_id INTEGER,
+            sport_key TEXT,
+            level INTEGER DEFAULT 0,
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0,
+            draws INTEGER DEFAULT 0,
+            PRIMARY KEY (country_id, sport_key)
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS sports_tournaments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sport_key TEXT,
+            name TEXT,
+            status TEXT DEFAULT 'registration',
+            created_at INTEGER,
+            started_at INTEGER,
+            winner_country_id INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS sports_tournament_members (
+            tournament_id INTEGER,
+            country_id INTEGER,
+            joined_at INTEGER,
+            PRIMARY KEY (tournament_id, country_id)
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS olympics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            status TEXT DEFAULT 'registration',
+            created_at INTEGER,
+            started_at INTEGER,
+            winner_country_id INTEGER
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS olympic_members (
+            olympics_id INTEGER,
+            country_id INTEGER,
+            joined_at INTEGER,
+            PRIMARY KEY (olympics_id, country_id)
+        )""")
+
+        c.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -378,12 +445,43 @@ def init_db():
             updated_at INTEGER
         )""")
 
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS country_structures (
+            country_id INTEGER,
+            structure_key TEXT,
+            quantity INTEGER DEFAULT 0,
+            PRIMARY KEY (country_id, structure_key)
+        )""")
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS blockades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attacker_id INTEGER,
+            defender_id INTEGER,
+            naval_power REAL DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            started_at INTEGER,
+            ended_at INTEGER
+        )""")
+
         _conn.commit()
 
     # --- migration امن برای دیتابیس‌های قدیمی‌تر: ستون‌های جدید رو بدون پاک‌کردن داده اضافه می‌کنه ---
     # (این دو خط عمداً خارج از "with _lock" هستن چون _add_column_if_missing خودش لاک می‌گیره)
     _add_column_if_missing("countries", "is_special", "INTEGER DEFAULT 0")
     _add_column_if_missing("countries", "is_vip", "INTEGER DEFAULT 0")
+    _add_column_if_missing("countries", "leaders", "INTEGER DEFAULT 100")
+    _add_column_if_missing("countries", "protest_started_at", "INTEGER DEFAULT NULL")
+    _add_column_if_missing("countries", "protest_active", "INTEGER DEFAULT 0")
+    _add_column_if_missing("territories", "is_closed", "INTEGER DEFAULT 0")
+    for _col, _def in [
+        ("capital", "TEXT DEFAULT NULL"), ("currency", "TEXT DEFAULT NULL"),
+        ("ground_commander", "TEXT DEFAULT NULL"), ("air_commander", "TEXT DEFAULT NULL"),
+        ("navy_commander", "TEXT DEFAULT NULL"), ("nuclear_commander", "TEXT DEFAULT NULL"),
+        ("army_name", "TEXT DEFAULT NULL"), ("president", "TEXT DEFAULT NULL"),
+        ("minister", "TEXT DEFAULT NULL"), ("government_type", "TEXT DEFAULT NULL")
+    ]:
+        _add_column_if_missing("countries", _col, _def)
 
 
 def _add_column_if_missing(table, column, coldef):
@@ -540,49 +638,90 @@ FACTORY_TYPES = {
 }
 # ظرفیت هر سطح کارخانه ۱.۴ برابر می‌شه، هزینه‌ی ارتقا هم همینطور
 
+# کارخانه‌های تولید منابع خام: هر دوره به‌جای مصرف، مستقیم منبع تولید می‌کنن
+RESOURCE_FACTORY_TYPES = {
+    "iron_mine": {"name": "⛏️ معدن آهن", "cost": 4000, "upkeep": 70, "output": 15, "produces": "iron"},
+    "coal_mine": {"name": "⚫ معدن زغال‌سنگ", "cost": 3500, "upkeep": 60, "output": 18, "produces": "coal"},
+    "copper_mine": {"name": "🟤 معدن مس", "cost": 5000, "upkeep": 85, "output": 10, "produces": "copper"},
+    "uranium_mine": {"name": "☢️ معدن اورانیوم", "cost": 14000, "upkeep": 220, "output": 4, "produces": "uranium"},
+    "oil_refinery": {"name": "🛢️ پالایشگاه نفت", "cost": 7000, "upkeep": 110, "output": 12, "produces": "oil"},
+    "gas_plant": {"name": "🔥 پالایشگاه گاز", "cost": 6500, "upkeep": 100, "output": 12, "produces": "gas"},
+    "steel_mill": {"name": "🔩 کارخانه فولاد", "cost": 5500, "upkeep": 90, "output": 14, "produces": "steel"},
+    "farm": {"name": "🌾 مزرعه", "cost": 2500, "upkeep": 45, "output": 20, "produces": "food"},
+}
+
+# مجموعه‌ی همه‌ی انواع کارخانه (تجهیزاتی + منابع) که تو ساخت/نگهداری/محاسبات استفاده می‌شه
+ALL_FACTORY_TYPES = {**FACTORY_TYPES, **RESOURCE_FACTORY_TYPES}
+
 # ۱۰ نوع نیروی زمینی
 GROUND_UNITS = [
-    ("soldier", "🪖 سرباز", 50, 1),
-    ("infantry", "🎖️ پیاده‌نظام", 80, 2),
-    ("special_forces", "🥷 نیروی ویژه", 500, 6),
-    ("apc", "🚙 نفربر زرهی", 1200, 8),
-    ("artillery", "💥 توپخانه", 2500, 12),
-    ("mlrs", "🎯 راکت‌انداز چندگانه", 4000, 16),
-    ("light_tank", "🛞 تانک سبک", 6000, 20),
-    ("main_tank", "🛡️ تانک اصلی", 12000, 30),
-    ("heavy_tank", "🏋️ تانک سنگین", 20000, 42),
-    ("air_defense", "🎯 پدافند هوایی", 9000, 22),
+    ("soldier", "🪖 سرباز", 15, 1),
+    ("infantry", "🎖️ پیاده‌نظام", 25, 2),
+    ("special_forces", "🥷 نیروی ویژه", 120, 6),
+    ("apc", "🚙 نفربر زرهی", 300, 8),
+    ("artillery", "💥 توپخانه", 600, 12),
+    ("mlrs", "🎯 راکت‌انداز چندگانه", 900, 16),
+    ("light_tank", "🛞 تانک سبک", 1400, 20),
+    ("main_tank", "🛡️ تانک اصلی", 2800, 30),
+    ("heavy_tank", "🏋️ تانک سنگین", 4500, 42),
+    ("air_defense", "🎯 پدافند هوایی", 2000, 22),
 ]
 
 # ۱۰ جنگنده/بمب‌افکن نمایندگی از ۳۰ مدل درخواستی (قابل گسترش)
 AIR_UNITS = [
-    ("f16", "✈️ اف-۱۶", 15000, 25), ("f22", "✈️ اف-۲۲ رپتور", 60000, 55),
-    ("f35", "✈️ اف-۳۵", 55000, 52), ("su35", "✈️ سوخو-۳۵", 45000, 48),
-    ("su57", "✈️ سوخو-۵۷", 65000, 58), ("mig29", "✈️ میگ-۲۹", 20000, 28),
-    ("j20", "✈️ جی-۲۰", 58000, 50), ("eurofighter", "✈️ یوروفایتر تایفون", 42000, 44),
-    ("b2", "💣 بی-۲ اسپیریت", 120000, 80), ("apache", "🚁 هلیکوپتر آپاچی", 18000, 26),
+    ("f16", "✈️ اف-۱۶", 3500, 25), ("f22", "✈️ اف-۲۲ رپتور", 14000, 55),
+    ("f35", "✈️ اف-۳۵", 13000, 52), ("su35", "✈️ سوخو-۳۵", 11000, 48),
+    ("su57", "✈️ سوخو-۵۷", 15000, 58), ("mig29", "✈️ میگ-۲۹", 5000, 28),
+    ("j20", "✈️ جی-۲۰", 14000, 50), ("eurofighter", "✈️ یوروفایتر تایفون", 10000, 44),
+    ("b2", "💣 بی-۲ اسپیریت", 28000, 80), ("apache", "🚁 هلیکوپتر آپاچی", 4500, 26),
 ]
 
 # ۱۰ ناو/زیردریایی نمایندگی از ۳۰ مدل درخواستی
 NAVY_UNITS = [
-    ("frigate", "🚢 ناوچه", 25000, 22), ("destroyer", "🚢 ناوشکن", 55000, 40),
-    ("cruiser", "🚢 رزم‌ناو", 90000, 55), ("submarine", "🌊 زیردریایی", 70000, 50),
-    ("nuclear_sub", "☢️ زیردریایی اتمی", 200000, 85), ("carrier", "🛳️ ناو هواپیمابر", 500000, 120),
-    ("corvette", "🚤 کوروت", 15000, 15), ("patrol_boat", "🚤 قایق گشت", 4000, 6),
-    ("landing_ship", "⚓ ناو پشتیبانی", 30000, 20), ("minesweeper", "⚓ ناو مین‌روب", 12000, 10),
+    ("frigate", "🚢 ناوچه", 6000, 22), ("destroyer", "🚢 ناوشکن", 13000, 40),
+    ("cruiser", "🚢 رزم‌ناو", 21000, 55), ("submarine", "🌊 زیردریایی", 16000, 50),
+    ("nuclear_sub", "☢️ زیردریایی اتمی", 45000, 85), ("carrier", "🛳️ ناو هواپیمابر", 110000, 120),
+    ("corvette", "🚤 کوروت", 3500, 15), ("patrol_boat", "🚤 قایق گشت", 1000, 6),
+    ("landing_ship", "⚓ ناو پشتیبانی", 7000, 20), ("minesweeper", "⚓ ناو مین‌روب", 3000, 10),
 ]
 
 # ۱۰ موشک نمایندگی از ۳۰ مدل درخواستی
 MISSILE_UNITS = [
-    ("short_range", "🚀 موشک برد کوتاه", 8000, 30), ("medium_range", "🚀 موشک برد میان‌برد", 25000, 55),
-    ("long_range", "🚀 موشک برد بلند", 60000, 90), ("cruise_missile", "🚀 موشک کروز", 35000, 65),
-    ("ballistic", "🚀 موشک بالستیک", 80000, 110), ("hypersonic", "🚀 موشک ابرصوت", 150000, 150),
-    ("anti_ship", "🚀 موشک ضدکشتی", 20000, 40), ("air_defense_missile", "🎯 موشک پدافند", 15000, 25),
-    ("icbm", "☢️ موشک قاره‌پیما", 400000, 260), ("tactical_nuke", "☢️ کلاهک تاکتیکی", 1000000, 500),
+    ("short_range", "🚀 موشک برد کوتاه", 2000, 30), ("medium_range", "🚀 موشک برد میان‌برد", 6000, 55),
+    ("long_range", "🚀 موشک برد بلند", 14000, 90), ("cruise_missile", "🚀 موشک کروز", 8000, 65),
+    ("ballistic", "🚀 موشک بالستیک", 18000, 110), ("hypersonic", "🚀 موشک ابرصوت", 35000, 150),
+    ("anti_ship", "🚀 موشک ضدکشتی", 5000, 40), ("air_defense_missile", "🎯 موشک پدافند", 3500, 25),
+    ("icbm", "☢️ موشک قاره‌پیما", 90000, 260), ("tactical_nuke", "☢️ کلاهک تاکتیکی", 220000, 500),
+]
+
+# تجهیزات بمبی — صرفاً آیتم‌های اقتصادی/موجودی داخل بازی
+# قدرت نظامی آن‌ها عمداً صفر است تا خرید این آیتم‌ها مستقیماً قدرت نظامی را تغییر ندهد.
+BOMB_UNITS = [
+    ("nuclear_bomb", "☢️ بمب هسته‌ای", 150000, 0),
+    ("tactical_atomic_bomb", "☢️ بمب اتم تاکتیکی", 80000, 0),
+    ("hydrogen_bomb", "☢️ بمب هیدروژنی", 50000, 0),
+    ("neutron_bomb", "☢️ بمب نوترونی", 20000, 0),
+]
+
+# سامانه‌های پدافندی — آمار کاملاً داخل بازی
+# فقط آهن به‌عنوان منبع ساخت مصرف می‌شود.
+DEFENSE_UNITS = [
+    ("air_defense_light", "🎯 پدافند هوایی سبک", 6000, 30, 5),
+    ("air_defense_medium", "🛡️ پدافند هوایی متوسط", 12000, 70, 10),
+    ("air_defense_heavy", "🏰 پدافند هوایی سنگین", 22000, 130, 18),
+    ("air_defense_network", "🌐 شبکه دفاع هوایی", 30000, 180, 25),
+    ("radar_defense", "📡 رادار دفاعی", 8000, 40, 6),
+    ("point_defense", "⚡ پدافند نقطه‌ای", 18000, 110, 15),
+    ("urban_defense", "🏙️ شبکه دفاع شهری", 15000, 80, 12),
+    ("early_warning", "🛰️ سامانه هشدار زودهنگام", 10000, 60, 8),
 ]
 
 ALL_UNITS = {}
-for key, name, cost, power in GROUND_UNITS + AIR_UNITS + NAVY_UNITS + MISSILE_UNITS:
+for key, name, cost, power in GROUND_UNITS + AIR_UNITS + NAVY_UNITS + MISSILE_UNITS + BOMB_UNITS:
+
+    ALL_UNITS[key] = {"name": name, "cost": cost, "power": power}
+
+for key, name, cost, power, iron_req in DEFENSE_UNITS:
     ALL_UNITS[key] = {"name": name, "cost": cost, "power": power}
 
 UNIT_CATEGORIES = {
@@ -590,7 +729,53 @@ UNIT_CATEGORIES = {
     "air": [u[0] for u in AIR_UNITS],
     "navy": [u[0] for u in NAVY_UNITS],
     "missile": [u[0] for u in MISSILE_UNITS],
+    "bomb": [u[0] for u in BOMB_UNITS],
+    "defense": [u[0] for u in DEFENSE_UNITS],
 }
+
+# نیروهای زمینیِ سبک فقط سلاح (فولاد) لازم دارن؛ بقیه‌ی زمینی‌ها (زرهی/توپخانه) هم آهن می‌خوان.
+GROUND_LIGHT_UNITS = {"soldier", "infantry"}
+# موشک‌های هسته‌ای/راهبردی به مقدار زیاد اورانیوم نیاز دارن.
+NUCLEAR_MISSILE_UNITS = {"icbm", "tactical_nuke"}
+
+
+def unit_resource_requirement(unit_key):
+    """
+    مقدار هر منبع که برای خرید یک عدد از این تجهیز (علاوه بر پول) لازمه.
+    زمینی سبک: فقط فولاد (اسلحه). زمینی سنگین/زرهی: فولاد + آهن.
+    هوایی و دریایی: فولاد + مس + نفت (سوخت). موشکی: فولاد + مس + اورانیوم (هسته‌ای‌ها بیشتر).
+    """
+    if unit_key in GROUND_LIGHT_UNITS:
+        return {"steel": 1}
+    if unit_key in UNIT_CATEGORIES["ground"]:
+        return {"steel": 2, "iron": 1}
+    if unit_key in UNIT_CATEGORIES["air"]:
+        return {"steel": 2, "copper": 1, "oil": 3}
+    if unit_key in UNIT_CATEGORIES["navy"]:
+        return {"steel": 3, "copper": 2, "oil": 4}
+    if unit_key in UNIT_CATEGORIES["missile"]:
+        if unit_key in NUCLEAR_MISSILE_UNITS:
+            return {"steel": 3, "copper": 2, "uranium": 5}
+        return {"steel": 2, "copper": 1, "uranium": 1}
+    if unit_key in UNIT_CATEGORIES["bomb"]:
+        bomb_uranium = {
+            "nuclear_bomb": 100,
+            "tactical_atomic_bomb": 80,
+            "hydrogen_bomb": 50,
+            "neutron_bomb": 10,
+        }
+        return {"uranium": bomb_uranium[unit_key]}
+    if unit_key in UNIT_CATEGORIES["defense"]:
+        defense_req = {u[0]: u[4] for u in DEFENSE_UNITS}
+        return {"iron": defense_req[unit_key]}
+    return {}
+
+
+def unit_requirement_text(unit_key):
+    req = unit_resource_requirement(unit_key)
+    if not req:
+        return ""
+    return "، ".join(f"{RESOURCE_FA[r]} {q}" for r, q in req.items())
 
 # درخت فناوری
 TECH_TREE = {
@@ -638,19 +823,19 @@ VIP_STARTING_BONUS = {
 PACKS = {
     "ground_pack": {
         "name": "🪖 پک زمینی", "desc": "تقویت سریع نیروی زمینی",
-        "units": {"soldier": 100, "infantry": 40, "main_tank": 8, "artillery": 5},
+        "units": {"soldier": 250, "infantry": 120, "special_forces": 25, "apc": 15, "artillery": 12, "mlrs": 8, "light_tank": 12, "main_tank": 10, "heavy_tank": 5, "air_defense": 8},
     },
     "air_pack": {
         "name": "✈️ پک هوایی", "desc": "چند فروند جنگنده و بالگرد آماده",
-        "units": {"f16": 4, "apache": 3},
+        "units": {"f16": 8, "f22": 2, "f35": 3, "su35": 4, "mig29": 4, "j20": 2, "eurofighter": 3, "b2": 1, "apache": 6},
     },
     "navy_pack": {
         "name": "🚢 پک دریایی", "desc": "تقویت ناوگان دریایی",
-        "units": {"frigate": 3, "corvette": 4, "submarine": 1},
+        "units": {"frigate": 6, "destroyer": 3, "cruiser": 2, "submarine": 3, "nuclear_sub": 1, "carrier": 1, "corvette": 6, "patrol_boat": 8, "landing_ship": 3, "minesweeper": 4},
     },
     "missile_pack": {
         "name": "🚀 پک موشکی", "desc": "چند موشک برد کوتاه و میان‌برد",
-        "units": {"short_range": 6, "medium_range": 3},
+        "units": {"short_range": 15, "medium_range": 8, "long_range": 4, "cruise_missile": 6, "anti_ship": 5, "air_defense_missile": 8},
     },
     "economy_pack": {
         "name": "💰 پک اقتصادی", "desc": "تزریق مستقیم پول نقد به خزانه‌ی کشورت",
@@ -704,6 +889,23 @@ def _post(method, payload, retries=3):
     return {"ok": False, "result": None}
 
 
+def _post_file(method, payload, file_field, file_path, retries=3):
+    """مثل _post ولی برای آپلود مستقیم یک فایل محلی (مثلاً عکس‌های داخل پوشه‌ی assets)."""
+    for attempt in range(retries):
+        try:
+            with open(file_path, "rb") as f:
+                files = {file_field: f}
+                r = requests.post(_url(method), data=payload, files=files, timeout=POLL_TIMEOUT + 20)
+            resp = r.json()
+            if not resp.get("ok", False):
+                print(f"[telegram_api] خطا در {method} (آپلود فایل): {resp}")
+            return resp
+        except Exception as e:
+            print(f"[telegram_api] خطای شبکه در {method} (آپلود فایل، تلاش {attempt+1}): {e}")
+            time.sleep(2)
+    return {"ok": False, "result": None}
+
+
 def get_updates(offset=None):
     payload = {"timeout": POLL_TIMEOUT}
     if offset is not None:
@@ -745,16 +947,34 @@ def send_to_channel(channel, text):
     return send_message(channel, text)
 
 
-def send_photo(chat_id, photo, caption=None, reply_markup=None):
+def send_photo(chat_id, photo, caption=None, reply_markup=None, parse_mode="HTML"):
     """
-    ارسال عکس. photo می‌تونه یک URL باشه یا یک file_id که قبلاً از یک عکس دریافتی گرفتیم.
+    ارسال عکس. `photo` می‌تونه یکی از این سه حالت باشه:
+    - یک file_id که قبلاً از یک عکس دریافتی گرفتیم
+    - یک URL
+    - مسیر یک فایل محلی روی گوشی/سیستم (مثلاً عکس‌های پیش‌فرض داخل پوشه‌ی assets) که در این حالت
+      مستقیماً آپلود می‌شه.
     """
-    body = {"chat_id": chat_id, "photo": photo}
+    is_local_file = isinstance(photo, str) and os.path.isfile(photo)
+    if is_local_file:
+        payload = {"chat_id": chat_id, "parse_mode": parse_mode}
+        if caption:
+            payload["caption"] = caption[:1024]
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
+        return _post_file("sendPhoto", payload, "photo", photo)
+
+    body = {"chat_id": chat_id, "photo": photo, "parse_mode": parse_mode}
     if caption:
         body["caption"] = caption[:1024]
     if reply_markup is not None:
         body["reply_markup"] = reply_markup
     return _post("sendPhoto", body)
+
+
+def delete_message(chat_id, message_id):
+    """حذف یک پیام (برای جایگزین‌کردنش با پیام عکس‌دار جدید)."""
+    return _post("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
 
 
 def send_invoice(chat_id, title, description, payload, amount_rial, reply_markup=None):
@@ -804,10 +1024,12 @@ def main_menu_kb():
     return kb([
         [("🏠 اطلاعات کشور", "menu:info"), ("💰 خزانه و اقتصاد", "menu:economy")],
         [("🏭 کارخانه‌ها", "menu:factory"), ("⛏️ منابع", "menu:resources")],
+        [("🏗️ توسعه و رفاه", "menu:development"), ("👥 جمعیت", "menu:population")],
         [("🪖 ارتش", "menu:army"), ("🛡️ دفاع", "menu:defense")],
         [("🔬 فناوری", "menu:tech"), ("🕵️ جاسوسی", "menu:spy")],
         [("🤝 دیپلماسی", "menu:diplomacy"), ("⚔️ جنگ", "menu:war")],
-        [("🗺️ سرزمین‌ها", "menu:territory"), ("🚢 تجارت", "menu:trade")],
+        [("🏆 ورزش", "menu:sports"), ("🗺️ سرزمین‌ها", "menu:territory")],
+        [("🚢 تجارت", "menu:trade")],
         [("📢 اخبار جهانی", "menu:news"), ("🏆 رتبه‌بندی", "menu:ranking")],
         [("📊 گزارش کشور", "menu:report"), ("⚙️ تنظیمات", "menu:settings")],
         [("🛒 فروشگاه ویژه", "menu:shop")],
@@ -985,7 +1207,7 @@ def list_factories(country_id):
 
 
 def factory_build_cost(ftype, current_count):
-    base = FACTORY_TYPES[ftype]["cost"]
+    base = ALL_FACTORY_TYPES[ftype]["cost"]
     return int(base * (1.15 ** current_count))
 
 
@@ -1011,7 +1233,7 @@ def upgrade_factory(factory_id):
     if not f:
         return False, "کارخانه پیدا نشد."
     c = get_country(f["country_id"])
-    cost = int(FACTORY_TYPES[f["ftype"]]["cost"] * 0.6 * f["level"])
+    cost = int(ALL_FACTORY_TYPES[f["ftype"]]["cost"] * 0.6 * f["level"])
     if c["treasury"] < cost:
         return False, f"خزانه کافی نیست. هزینه ارتقا: {cost:,} 💰"
     execute("UPDATE countries SET treasury = treasury - ? WHERE id=?", (cost, f["country_id"]))
@@ -1033,9 +1255,21 @@ def buy_unit(country_id, unit_key, qty):
     c = get_country(country_id)
     unit = ALL_UNITS[unit_key]
     total_cost = unit["cost"] * qty
+
+    req = unit_resource_requirement(unit_key)
+    needed = {r: amt * qty for r, amt in req.items()}
+    stock = get_resources(country_id)
+    missing = [f"{RESOURCE_FA[r]} (نیاز: {amt}, داری: {int(stock.get(r, 0))})"
+               for r, amt in needed.items() if stock.get(r, 0) < amt]
+
     if c["treasury"] < total_cost:
         return False, f"خزانه کافی نیست. هزینه کل: {total_cost:,} 💰"
+    if missing:
+        return False, "منابع کافی نیست: " + "، ".join(missing)
+
     execute("UPDATE countries SET treasury = treasury - ? WHERE id=?", (total_cost, country_id))
+    for r, amt in needed.items():
+        add_resource(country_id, r, -amt)
     execute(
         "INSERT INTO army (country_id, unit_key, quantity) VALUES (?,?,?) "
         "ON CONFLICT(country_id, unit_key) DO UPDATE SET quantity = quantity + ?",
@@ -1046,10 +1280,14 @@ def buy_unit(country_id, unit_key, qty):
 
 
 def military_power(country_id):
+    c = get_country(country_id)
+    if c and c["leaders"] <= 0:
+        return 0
     army = get_army(country_id)
     power = 0
     for key, qty in army.items():
-        power += ALL_UNITS[key]["power"] * qty
+        if key in ALL_UNITS:
+            power += ALL_UNITS[key]["power"] * qty
     tech = query_one(
         "SELECT level FROM tech WHERE country_id=? AND tech_key='military_tech'", (country_id,)
     )
@@ -1069,13 +1307,13 @@ def economic_tick():
     for c in countries:
         cid = c["id"]
         # درآمد مالیاتی بر اساس جمعیت و اقتصاد
-        tax_income = (c["population"] / 1_000_000) * c["tax_rate"] * (c["economy_score"] / 10)
+        tax_income = (c["population"] / 500_000) * c["tax_rate"] * (c["economy_score"] / 10)
         # هزینه نگهداری ارتش
         army = get_army(cid)
-        upkeep = sum(ALL_UNITS[k]["cost"] * 0.002 * q for k, q in army.items())
+        upkeep = sum(ALL_UNITS[k]["cost"] * 0.0004 * q for k, q in army.items())
         # هزینه نگهداری کارخانه‌ها
         factories = list_factories(cid)
-        factory_upkeep = sum(FACTORY_TYPES[f["ftype"]]["upkeep"] * f["level"] for f in factories)
+        factory_upkeep = sum(ALL_FACTORY_TYPES[f["ftype"]]["upkeep"] * f["level"] for f in factories)
         # تجارت تنگه‌ها
         strait_income = 0
         straits = query("SELECT * FROM territories WHERE owner_id=? AND is_strait=1", (cid,))
@@ -1097,7 +1335,11 @@ def economic_tick():
         # تولید کارخانه‌ها (به شکل منابع ذخیره‌شده به‌عنوان تجهیزات آماده نمی‌شه؛
         # اینجا خروجی کارخانه به‌صورت سکه‌ی اضافه به خزانه منظور می‌شه چون تجهیزات با buy_unit خریداری می‌شن)
         for f in factories:
-            ftype_data = FACTORY_TYPES[f["ftype"]]
+            ftype_data = ALL_FACTORY_TYPES[f["ftype"]]
+            if "produces" in ftype_data:
+                add_resource(cid, ftype_data["produces"], ftype_data["output"] * f["level"])
+                execute("UPDATE factories SET last_production=? WHERE id=?", (now(), f["id"]))
+                continue
             can_produce = True
             for res, need in ftype_data["consumes"].items():
                 stock = query_one(
@@ -1117,6 +1359,12 @@ def economic_tick():
             "UPDATE countries SET satisfaction = MAX(0, MIN(100, satisfaction + ?)) WHERE id=?",
             (satisfaction_delta, cid),
         )
+        # رشد طبیعی جمعیت؛ رضایت بالاتر، رشد جمعیتی بالاتر
+        sat = float(c["satisfaction"]) + satisfaction_delta
+        growth_rate = 0.00020 if sat >= 80 else (0.00012 if sat >= 60 else (0.00005 if sat >= 40 else 0.0))
+        if growth_rate:
+            execute("UPDATE countries SET population=population+MAX(1,population*?) WHERE id=?", (growth_rate, cid))
+
 
 
 def maybe_trigger_random_event():
@@ -1155,6 +1403,34 @@ EVENT_IMAGE_CATEGORIES = {
     "war_win": "🏆 پیروزی در جنگ",
 }
 
+# عکس هر بخش از منوی اصلی بازی. وقتی ادمین برای یک بخش عکس تنظیم کنه، هر بار بازیکن
+# وارد اون بخش بشه، به‌جای پیام متنی ساده، یک پیام عکس‌دار (همراه همون توضیحات) براش ارسال می‌شه.
+SECTION_IMAGE_CATEGORIES = {
+    "main": "🏠 منوی اصلی",
+    "info": "🏠 اطلاعات کشور",
+    "economy": "💰 خزانه و اقتصاد",
+    "resources": "⛏️ منابع",
+    "factory": "🏭 کارخانه‌ها",
+    "army": "🪖 ارتش",
+    "defense": "🛡️ دفاع",
+    "tech": "🔬 فناوری",
+    "spy": "🕵️ جاسوسی",
+    "diplomacy": "🤝 دیپلماسی",
+    "war": "⚔️ جنگ",
+    "territory": "🗺️ سرزمین‌ها",
+    "trade": "🚢 تجارت",
+    "news": "📢 اخبار جهانی",
+    "ranking": "🏆 رتبه‌بندی",
+    "report": "📊 گزارش کشور",
+    "settings": "⚙️ تنظیمات",
+    "shop": "🛒 فروشگاه ویژه",
+    "un": "🏛️ سازمان ملل",
+    "alliance": "🏰 اتحادها",
+}
+
+# مجموع هر دو دسته (رویدادهای کانال خبری + بخش‌های منو) برای اعتبارسنجی و نمایش برچسب.
+ALL_IMAGE_CATEGORIES = {**EVENT_IMAGE_CATEGORIES, **SECTION_IMAGE_CATEGORIES}
+
 
 def get_event_image(category):
     row = query_one("SELECT photo FROM event_images WHERE category=?", (category,))
@@ -1167,6 +1443,20 @@ def set_event_image(category, photo):
         "ON CONFLICT(category) DO UPDATE SET photo=?, updated_at=?",
         (category, photo, now(), photo, now()),
     )
+
+
+def ensure_default_section_images():
+    """
+    برای بخش‌هایی که ادمین هنوز عکس دستی براشون تنظیم نکرده، عکس پیش‌فرضِ گرافیکیِ
+    داخل پوشه‌ی assets رو به‌عنوان عکس اون بخش ثبت می‌کنه (اگه فایلش موجود باشه).
+    اگه ادمین بعداً از پنل، عکس دیگه‌ای برای اون بخش بفرسته، همون جایگزین می‌شه.
+    """
+    for cat in SECTION_IMAGE_CATEGORIES:
+        if get_event_image(cat):
+            continue
+        default_path = os.path.join(ASSETS_DIR, f"section_{cat}.png")
+        if os.path.isfile(default_path):
+            set_event_image(cat, default_path)
 
 
 def add_news(text, category="general"):
@@ -1191,140 +1481,6 @@ def latest_news(limit=10):
 
 # ------------------------------------------------------------------------ جنگ
 
-def compute_war_power(country_id):
-    c = get_country(country_id)
-    mil = military_power(country_id)
-    tech = query("SELECT tech_key, level FROM tech WHERE country_id=?", (country_id,))
-    tech_bonus = 1 + 0.03 * sum(t["level"] for t in tech)
-    economy_factor = 1 + (c["economy_score"] / 200)
-    morale_factor = 0.5 + (c["morale"] / 100)
-    allies = query(
-        "SELECT * FROM relations WHERE (country_a=? OR country_b=?) AND status='alliance'",
-        (country_id, country_id),
-    )
-    ally_bonus = 1 + 0.05 * len(allies)
-    total = mil * tech_bonus * economy_factor * morale_factor * ally_bonus
-    return total
-
-
-def declare_war(attacker_id, defender_id):
-    existing = query_one(
-        "SELECT * FROM wars WHERE status='active' AND "
-        "((attacker_id=? AND defender_id=?) OR (attacker_id=? AND defender_id=?))",
-        (attacker_id, defender_id, defender_id, attacker_id),
-    )
-    if existing:
-        return False, "همین الان جنگ فعالی بین این دو کشور وجود داره."
-    war_id = execute(
-        "INSERT INTO wars (attacker_id, defender_id, status, started_at) VALUES (?,?,'active',?)",
-        (attacker_id, defender_id, now()),
-    )
-    execute(
-        "INSERT INTO relations (country_a, country_b, status, updated_at) VALUES (?,?, 'war', ?) "
-        "ON CONFLICT(country_a, country_b) DO UPDATE SET status='war', updated_at=?",
-        (min(attacker_id, defender_id), max(attacker_id, defender_id), now(), now()),
-    )
-    atk = get_country(attacker_id)
-    dfn = get_country(defender_id)
-    add_news(f"⚔️ {atk['flag']} {atk['name']} به {dfn['flag']} {dfn['name']} اعلان جنگ کرد.")
-    return True, war_id
-
-
-def resolve_battle(war_id):
-    """
-    یک راند نبرد رو حل می‌کنه. آسیب هر دور مستقیماً متناسب با نسبت قدرت دو طرفه:
-    هرچی یک طرف نسبت به طرف مقابل برتری بیشتری داشته باشه، آسیب بیشتری در همون
-    دور می‌زنه (فتح خیلی سریع‌تر). اگه مدافع عملاً هیچ قدرتی نداشته باشه، تقریباً
-    در همون دور اول فتح می‌شه.
-    """
-    war = query_one("SELECT * FROM wars WHERE id=?", (war_id,))
-    if not war or war["status"] != "active":
-        return None
-
-    attacker = get_country(war["attacker_id"])
-    defender = get_country(war["defender_id"])
-
-    atk_power = compute_war_power(war["attacker_id"])
-    def_power = compute_war_power(war["defender_id"]) * 1.15  # مزیت دفاعی
-
-    atk_power_safe = max(atk_power, 0.01)
-    def_power_safe = max(def_power, 0.01)
-    ratio = atk_power_safe / def_power_safe  # هرچی بزرگ‌تر از ۱، مهاجم برتره؛ کوچیک‌تر از ۱ یعنی مدافع برتره
-
-    BASE_DMG = 30
-    dmg_to_defender = BASE_DMG * ratio
-    dmg_to_attacker = BASE_DMG / ratio
-
-    # کمی نوسان شانسی؛ فقط سهم رو کمی جابه‌جا می‌کنه، نتیجه رو کاملاً معکوس نمی‌کنه
-    luck = random.uniform(-0.15, 0.15)
-    dmg_to_defender *= (1 + luck)
-    dmg_to_attacker *= max(0.0, 1 - luck)
-
-    # سقف: حداکثر آسیب هر دور ۲ برابر maxHP، تا وقتی برتری خیلی زیاده فتح در همون دور اتفاق بیفته
-    dmg_to_defender = min(dmg_to_defender, defender["max_hp"] * 2)
-    dmg_to_attacker = min(dmg_to_attacker, attacker["max_hp"] * 2)
-
-    new_defender_hp = max(0, defender["hp"] - dmg_to_defender)
-    new_attacker_hp = max(0, attacker["hp"] - dmg_to_attacker)
-
-    execute("UPDATE countries SET hp=? WHERE id=?", (new_defender_hp, war["defender_id"]))
-    execute("UPDATE countries SET hp=? WHERE id=?", (new_attacker_hp, war["attacker_id"]))
-    execute("UPDATE wars SET atk_casualties = atk_casualties + ?, def_casualties = def_casualties + ? WHERE id=?",
-               (dmg_to_attacker, dmg_to_defender, war_id))
-
-    winner = None
-    if new_defender_hp <= 0:
-        winner = "attacker"
-    if new_attacker_hp <= 0:
-        winner = "defender" if winner != "attacker" else "draw"
-
-    result = {"ratio": ratio, "dmg_to_defender": dmg_to_defender,
-              "dmg_to_attacker": dmg_to_attacker, "winner": winner}
-
-    if winner:
-        end_war(war_id, winner)
-        result["ended"] = True
-    else:
-        result["ended"] = False
-    return result
-
-
-def end_war(war_id, winner):
-    war = query_one("SELECT * FROM wars WHERE id=?", (war_id,))
-    atk = get_country(war["attacker_id"])
-    dfn = get_country(war["defender_id"])
-    execute("UPDATE wars SET status='ended', ended_at=?, result=? WHERE id=?", (now(), winner, war_id))
-    execute(
-        "UPDATE relations SET status='neutral', updated_at=? WHERE country_a=? AND country_b=?",
-        (now(), min(war["attacker_id"], war["defender_id"]), max(war["attacker_id"], war["defender_id"])),
-    )
-
-    if winner == "attacker":
-        # مهاجم برنده شده: کشور مدافع کاملاً نابود می‌شه، همه‌ی سرزمین‌هاش تصرف می‌شه،
-        # و خودش به یک کشور آزاد و بدون مالک تبدیل می‌شه (قابل انتخاب دوباره برای هرکسی، حتی همون بازیکن).
-        execute(
-            "UPDATE countries SET wins = wins + 1, conquests = conquests + 1, hp = max_hp * 0.5 WHERE id=?",
-            (war["attacker_id"],),
-        )
-        captured_count = transfer_all_territories(war["defender_id"], war["attacker_id"])
-        add_news(
-            f"🏆 {atk['flag']} {atk['name']} کشور {dfn['flag']} {dfn['name']} را در جنگ کاملاً نابود و اشغال کرد "
-            f"و {captured_count} منطقه را تصرف کرد.",
-            category="war_win",
-        )
-        destroy_and_liberate_country(war["defender_id"])
-        add_news(f"☠️ {dfn['flag']} {dfn['name']} به کشوری آزاد و بدون مالک تبدیل شد و دوباره قابل انتخابه.",
-                 category="destruction")
-    elif winner == "defender":
-        execute("UPDATE countries SET wins = wins + 1, hp = max_hp * 0.5 WHERE id=?", (war["defender_id"],))
-        execute("UPDATE countries SET losses = losses + 1, hp = max_hp * 0.5 WHERE id=?", (war["attacker_id"],))
-        add_news(f"🛡️ {dfn['flag']} {dfn['name']} در برابر حمله‌ی {atk['flag']} {atk['name']} مقاومت کرد و پیروز شد.")
-    else:
-        execute("UPDATE countries SET hp = max_hp * 0.5 WHERE id IN (?,?)",
-               (war["attacker_id"], war["defender_id"]))
-        add_news(f"⚖️ جنگ میان {atk['flag']} {atk['name']} و {dfn['flag']} {dfn['name']} بدون برنده پایان یافت.")
-
-
 def destroy_and_liberate_country(country_id):
     """
     وقتی کشوری در جنگ کاملاً نابود می‌شه: مالکش (اگه داشته) آزاد می‌شه تا بتونه
@@ -1340,11 +1496,14 @@ def destroy_and_liberate_country(country_id):
     execute(
         "UPDATE countries SET owner_id=NULL, treasury=50000, debt=0, hp=max_hp, wins=0, losses=0, "
         "conquests=0, satisfaction=60, morale=70, tax_rate=0.20, military_budget_pct=30, "
-        "research_budget_pct=15 WHERE id=?",
+        "research_budget_pct=15, leaders=100, protest_started_at=NULL, protest_active=0 WHERE id=?",
         (country_id,),
     )
     execute("DELETE FROM army WHERE country_id=?", (country_id,))
     execute("DELETE FROM factories WHERE country_id=?", (country_id,))
+    execute("DELETE FROM country_structures WHERE country_id=?", (country_id,))
+    execute("UPDATE blockades SET status='ended', ended_at=? WHERE defender_id=? AND status='active'", (now(), country_id))
+    execute("UPDATE blockades SET status='ended', ended_at=? WHERE attacker_id=? AND status='active'", (now(), country_id))
     execute("DELETE FROM tech WHERE country_id=?", (country_id,))
     execute("DELETE FROM research_queue WHERE country_id=?", (country_id,))
     for r in RESOURCES:
@@ -1445,14 +1604,6 @@ def respond_request(request_id, accept):
             "peace": "neutral", "trade_pact": "trade_pact",
         }
         set_relation(req["from_id"], req["to_id"], status_map[req["kind"]])
-        if req["kind"] == "peace":
-            active_war = query_one(
-                "SELECT * FROM wars WHERE status='active' AND "
-                "((attacker_id=? AND defender_id=?) OR (attacker_id=? AND defender_id=?))",
-                (req["from_id"], req["to_id"], req["to_id"], req["from_id"]),
-            )
-            if active_war:
-                end_war(active_war["id"], "draw")
         a = get_country(req["from_id"])
         b = get_country(req["to_id"])
         add_news(f"🤝 {a['flag']} {a['name']} و {b['flag']} {b['name']} به توافق «{REQUEST_KINDS[req['kind']]}» رسیدند.")
@@ -1651,11 +1802,50 @@ def get_market():
     return {r["resource"]: dict(r) for r in rows}
 
 
+def is_blockaded(country_id):
+    row = query_one("SELECT id FROM blockades WHERE defender_id=? AND status='active' LIMIT 1", (country_id,))
+    return row is not None
+
+
+def closed_strait_count():
+    row = query_one("SELECT COUNT(*) AS n FROM territories WHERE is_strait=1 AND is_closed=1")
+    return int(row["n"] if row else 0)
+
+
+def resource_market_price(resource):
+    """قیمت نهایی بازار با اثر تنگه‌های بسته؛ اعداد کاملاً مکانیک اقتصادی بازی هستند."""
+    m = query_one("SELECT * FROM market WHERE resource=?", (resource,))
+    if not m:
+        return float(RESOURCE_BASE_PRICE[resource])
+    closed = closed_strait_count()
+    # هر تنگه‌ی بسته 25٪ به قیمت منابع اضافه می‌کند؛ سقف 3 برابر قیمت بازار پایه/فعلی.
+    multiplier = min(3.0, 1.0 + (0.25 * closed))
+    return float(m["price"]) * multiplier
+
+
+def toggle_strait_closure(country_id, territory_id):
+    t = query_one("SELECT * FROM territories WHERE id=? AND is_strait=1", (territory_id,))
+    if not t:
+        return False, "این تنگه پیدا نشد."
+    if t["owner_id"] != country_id:
+        return False, "فقط مالک تنگه می‌تواند آن را ببندد یا باز کند."
+    new_state = 0 if int(t["is_closed"] or 0) else 1
+    execute("UPDATE territories SET is_closed=? WHERE id=?", (new_state, territory_id))
+    owner = get_country(country_id)
+    if new_state:
+        add_news(f"🌊 {owner['flag']} {owner['name']} تنگه «{t['name']}» را بست؛ قیمت منابع در بازار جهانی افزایش یافت.", category="trade")
+        return True, f"تنگه «{t['name']}» بسته شد. قیمت منابع بازار افزایش یافت. 📈"
+    add_news(f"🌊 {owner['flag']} {owner['name']} تنگه «{t['name']}» را باز کرد؛ فشار قیمتی بازار کاهش یافت.", category="trade")
+    return True, f"تنگه «{t['name']}» باز شد. فشار قیمتی بازار کاهش یافت. 📉"
+
+
 def buy_resource(country_id, resource, amount):
+    if is_blockaded(country_id):
+        return False, "🚢 تجارت کشورت به‌دلیل محاصره دریایی متوقف شده."
     if resource not in RESOURCES or amount <= 0:
         return False, "منبع نامعتبر."
     m = query_one("SELECT * FROM market WHERE resource=?", (resource,))
-    price = m["price"]
+    price = resource_market_price(resource)
     total = price * amount
     c = get_country(country_id)
     if c["treasury"] < total:
@@ -1673,13 +1863,15 @@ def buy_resource(country_id, resource, amount):
 
 
 def sell_resource(country_id, resource, amount):
+    if is_blockaded(country_id):
+        return False, "🚢 تجارت کشورت به‌دلیل محاصره دریایی متوقف شده."
     if resource not in RESOURCES or amount <= 0:
         return False, "منبع نامعتبر."
     res = get_resources(country_id)
     if res.get(resource, 0) < amount:
         return False, "این مقدار منبع رو نداری."
     m = query_one("SELECT * FROM market WHERE resource=?", (resource,))
-    price = m["price"]
+    price = resource_market_price(resource)
     total = price * amount * 0.9  # کمیسیون فروش
     add_resource(country_id, resource, -amount)
     execute("UPDATE countries SET treasury = treasury + ? WHERE id=?", (total, country_id))
@@ -1736,6 +1928,41 @@ def total_territory_value(country_id):
 def territory_count(country_id):
     row = query_one("SELECT COUNT(*) n FROM territories WHERE owner_id=?", (country_id,))
     return row["n"] if row else 0
+
+
+def capture_cost(strategic_value):
+    return int(strategic_value * 5000)
+
+
+def attempt_capture_strait(attacker_id, territory_id):
+    t = query_one("SELECT * FROM territories WHERE id=? AND is_strait=1", (territory_id,))
+    if not t:
+        return False, "این تنگه پیدا نشد."
+    if t["owner_id"] == attacker_id:
+        return False, "این تنگه همین الان مال خودته."
+    cost = capture_cost(t["strategic_value"])
+    c = get_country(attacker_id)
+    if c["treasury"] < cost:
+        return False, f"برای این عملیات به {cost:,} 💰 نیاز داری."
+    execute("UPDATE countries SET treasury = treasury - ? WHERE id=?", (cost, attacker_id))
+
+    attacker_power = military_power(attacker_id)
+    required = t["strategic_value"] * 500
+    success_chance = attacker_power / (attacker_power + required + 1)
+    success_chance = max(0.05, min(0.9, success_chance))
+    success = random.random() < success_chance
+
+    if success:
+        old_owner_id = t["owner_id"]
+        execute("UPDATE territories SET owner_id=? WHERE id=?", (attacker_id, territory_id))
+        ac = get_country(attacker_id)
+        if old_owner_id:
+            oc = get_country(old_owner_id)
+            add_news(f"🌊 {ac['flag']} {ac['name']} کنترل «{t['name']}» را از {oc['flag']} {oc['name']} گرفت.")
+        else:
+            add_news(f"🌊 {ac['flag']} {ac['name']} کنترل «{t['name']}» را به دست گرفت.")
+        return True, "تصرف موفق بود! 🎉"
+    return False, "عملیات تصرف شکست خورد؛ نیروهات عقب‌نشینی کردن."
 
 
 def capture_random_territory(winner_id, loser_id):
@@ -2334,6 +2561,23 @@ def fmt_num(n):
         return str(n)
 
 
+def bar(pct, length=10):
+    """یه نوار پیشرفت گرافیکی با کاراکترهای بلوکی می‌سازه، مثلاً: ▰▰▰▰▰▰▱▱▱▱ 60%"""
+    try:
+        pct = max(0, min(100, float(pct)))
+    except Exception:
+        pct = 0
+    filled = round((pct / 100) * length)
+    return "▰" * filled + "▱" * (length - filled) + f" {pct:.0f}%"
+
+
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+def rank_prefix(i):
+    return MEDALS.get(i, f"{i}.")
+
+
 def require_country(user_id):
     u = get_user(user_id)
     if not u or not u["country_id"]:
@@ -2444,12 +2688,50 @@ def do_select_country(chat_id, message_id, user_id, username, country_id):
 
 # ------------------------------------------------------------------- ابزار رندر
 
-def render(chat_id, message_id, text, reply_markup=None):
+def render(chat_id, message_id, text, reply_markup=None, section=None):
+    """
+    نمایش یک صفحه از ربات.
+    اگه پارامتر section پاس داده بشه و ادمین از قبل برای اون بخش عکسی تنظیم کرده باشه،
+    به‌جای ویرایش پیام متنی، پیام قبلی حذف و یک پیام عکس‌دار (با همون متن به‌عنوان کپشن) فرستاده می‌شه.
+    """
+    img = get_event_image(section) if section else None
+    if img:
+        if message_id:
+            try:
+                delete_message(chat_id, message_id)
+            except Exception:
+                pass
+        caption = text if len(text) <= 1024 else text[:1021] + "..."
+        r = send_photo(chat_id, img, caption=caption, reply_markup=reply_markup)
+        if r and r.get("ok"):
+            return
+        # اگه ارسال عکس (مثلا به‌خاطر لینک/فایل نامعتبر) شکست خورد، به حالت متنی برمی‌گردیم
+
     if message_id:
         r = edit_message_text(chat_id, message_id, text, reply_markup=reply_markup)
         if r and r.get("ok"):
             return
     send_message(chat_id, text, reply_markup=reply_markup)
+
+
+def show_country_lookup(chat_id, target_user_id):
+    """برای دستور /country تو گروه: وقتی رو پیام یه نفر ریپلای بشه، کشورش نشون داده می‌شه."""
+    u = get_user(target_user_id)
+    if not u or not u["country_id"]:
+        send_message(chat_id, "این کاربر هنوز کشوری تو بازی انتخاب نکرده.")
+        return
+    c = get_country(u["country_id"])
+    if not c:
+        send_message(chat_id, "این کاربر هنوز کشوری تو بازی انتخاب نکرده.")
+        return
+    text = (
+        f"{c['flag']} <b>{c['name']}</b>\n"
+        f"💰 خزانه: {fmt_num(c['treasury'])}\n"
+        f"🪖 قدرت نظامی: {fmt_num(military_power(c['id']))}\n"
+        f"🗺️ قلمرو: {territory_count(c['id'])} منطقه\n"
+        f"🏆 برد/باخت: {c['wins']}/{c['losses']}"
+    )
+    send_message(chat_id, text)
 
 
 def send_main_menu(chat_id, c, message_id=None):
@@ -2460,11 +2742,10 @@ def send_main_menu(chat_id, c, message_id=None):
         f"🪖 قدرت نظامی: {fmt_num(military_power(c['id']))}\n"
         f"🗺️ قلمرو: {territory_count(c['id'])} منطقه\n"
         f"📈 اقتصاد: {fmt_num(c['economy_score'])}\n"
-        f"❤️ سلامت کشور: {fmt_num(c['hp'])}/{fmt_num(c['max_hp'])}\n"
-        f"😊 رضایت مردم: {fmt_num(c['satisfaction'])}%\n"
+        f"😊 رضایت مردم: {bar(c['satisfaction'])}\n"
         "━━━━━━━━━━━━"
     )
-    render(chat_id, message_id, text, main_menu_kb())
+    render(chat_id, message_id, text, main_menu_kb(), section="main")
 
 
 # ---------------------------------------------------------------- اطلاعات کشور
@@ -2481,13 +2762,12 @@ def show_info(chat_id, message_id, user_id):
         f"💰 خزانه: {fmt_num(c['treasury'])}\n"
         f"💳 بدهی: {fmt_num(c['debt'])}\n"
         f"📈 اقتصاد: {fmt_num(c['economy_score'])}\n"
-        f"😊 رضایت: {fmt_num(c['satisfaction'])}%\n"
-        f"🪖 روحیه: {fmt_num(c['morale'])}%\n"
-        f"❤️ سلامت: {fmt_num(c['hp'])}/{fmt_num(c['max_hp'])}\n"
+        f"😊 رضایت: {bar(c['satisfaction'])}\n"
+        f"🪖 روحیه: {bar(c['morale'])}\n"
         f"🏆 برد/باخت: {c['wins']}/{c['losses']}\n"
         f"🗺️ قلمرو: {territory_count(c['id'])} منطقه\n"
     )
-    render(chat_id, message_id, text, back_kb())
+    render(chat_id, message_id, text, back_kb(), section="info")
 
 
 # -------------------------------------------------------------- اقتصاد و بودجه
@@ -2512,7 +2792,7 @@ def show_economy(chat_id, message_id, user_id):
         [("➕ بودجه تحقیقات", "resb:up"), ("➖ بودجه تحقیقات", "resb:down")],
         [("🔙 بازگشت", "menu:main")],
     ]
-    render(chat_id, message_id, text, kb(rows))
+    render(chat_id, message_id, text, kb(rows), section="economy")
 
 
 def adjust_tax(user_id, direction):
@@ -2522,6 +2802,8 @@ def adjust_tax(user_id, direction):
     delta = 0.02 if direction == "up" else -0.02
     new_rate = max(0.05, min(0.60, c["tax_rate"] + delta))
     execute("UPDATE countries SET tax_rate=? WHERE id=?", (new_rate, c["id"]))
+    if direction == "down" and new_rate < c["tax_rate"]:
+        execute("UPDATE countries SET satisfaction=MIN(100, satisfaction+2) WHERE id=?", (c["id"],))
 
 
 def adjust_budget(user_id, field, direction):
@@ -2546,7 +2828,7 @@ def show_resources(chat_id, message_id, user_id):
         lines.append(f"{RESOURCE_FA[r]}: {fmt_num(res[r])}")
     text = "\n".join(lines)
     rows = [[("🚢 رفتن به بازار تجارت", "menu:trade")], [("🔙 بازگشت", "menu:main")]]
-    render(chat_id, message_id, text, kb(rows))
+    render(chat_id, message_id, text, kb(rows), section="resources")
 
 
 # ----------------------------------------------------------------- کارخانه‌ها
@@ -2562,18 +2844,23 @@ def show_factory_menu(chat_id, message_id, user_id):
     lines = [f"🏭 <b>کارخانه‌های {c['name']}</b>\n"]
     if owned:
         for f in owned:
-            info = FACTORY_TYPES[f["ftype"]]
+            info = ALL_FACTORY_TYPES[f["ftype"]]
             lines.append(f"{info['name']} — سطح {f['level']} (#{f['id']})")
     else:
         lines.append("هنوز کارخانه‌ای نساختی.")
     text = "\n".join(lines)
 
     rows = []
+    rows.append([("🏭 — کارخانه‌های تجهیزات نظامی — 🏭", "noop")])
     for ftype, info in FACTORY_TYPES.items():
         cost = factory_build_cost(ftype, counts.get(ftype, 0))
         rows.append([(f"{info['name']} — {fmt_num(cost)} 💰", f"buildf:{ftype}")])
+    rows.append([("⛏️ — کارخانه‌های منابع خام — ⛏️", "noop")])
+    for ftype, info in RESOURCE_FACTORY_TYPES.items():
+        cost = factory_build_cost(ftype, counts.get(ftype, 0))
+        rows.append([(f"{info['name']} — {fmt_num(cost)} 💰", f"buildf:{ftype}")])
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, text, kb(rows))
+    render(chat_id, message_id, text, kb(rows), section="factory")
 
 
 def do_build_factory(chat_id, message_id, user_id, ftype):
@@ -2589,7 +2876,7 @@ def do_build_factory(chat_id, message_id, user_id, ftype):
 
 # --------------------------------------------------------------------- ارتش
 
-CATEGORY_FA = {"ground": "🪖 زمینی", "air": "✈️ هوایی", "navy": "🚢 دریایی", "missile": "🚀 موشکی"}
+CATEGORY_FA = {"ground": "🪖 زمینی", "air": "✈️ هوایی", "navy": "🚢 دریایی", "missile": "🚀 موشکی", "bomb": "☢️ بمبی", "defense": "🛡️ پدافندی"}
 
 
 def show_army_menu(chat_id, message_id, user_id):
@@ -2597,9 +2884,9 @@ def show_army_menu(chat_id, message_id, user_id):
     if not c:
         return
     text = f"🪖 <b>ارتش {c['name']}</b>\nدسته‌ی موردنظر رو انتخاب کن:"
-    rows = [[(CATEGORY_FA[cat], f"armycat:{cat}")] for cat in UNIT_CATEGORIES]
+    rows = [[(CATEGORY_FA[cat], f"armycat:{cat}")] for cat in UNIT_CATEGORIES if cat != "defense"]
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, text, kb(rows))
+    render(chat_id, message_id, text, kb(rows), section="army")
 
 
 def show_army_category(chat_id, message_id, user_id, cat):
@@ -2612,7 +2899,9 @@ def show_army_category(chat_id, message_id, user_id, cat):
     for key in UNIT_CATEGORIES[cat]:
         u = ALL_UNITS[key]
         qty = army.get(key, 0)
-        lines.append(f"{u['name']}: {qty} عدد (قیمت واحد {fmt_num(u['cost'])})")
+        req_text = unit_requirement_text(key)
+        req_line = f" + {req_text}" if req_text else ""
+        lines.append(f"{u['name']}: {qty} عدد (قیمت واحد {fmt_num(u['cost'])}{req_line})")
         rows.append([(f"🛒 خرید {u['name']}", f"buyunit:{key}")])
     rows.append([("🔙 بازگشت", "menu:army")])
     render(chat_id, message_id, "\n".join(lines), kb(rows))
@@ -2624,9 +2913,12 @@ def ask_unit_quantity(chat_id, message_id, user_id, unit_key):
         return
     u = ALL_UNITS[unit_key]
     AWAITING[user_id] = {"action": "buy_unit", "unit_key": unit_key, "chat_id": chat_id}
+    req_text = unit_requirement_text(unit_key)
+    req_line = f"منابع لازم (به ازای هر عدد): {req_text}\n" if req_text else ""
     text = (
         f"🛒 خرید {u['name']}\n"
         f"قیمت واحد: {fmt_num(u['cost'])} 💰\n"
+        f"{req_line}"
         f"خزانه‌ی تو: {fmt_num(c['treasury'])} 💰\n\n"
         "چند عدد می‌خوای بخری؟ فقط عدد رو بفرست (یا برای انصراف /cancel بزن)."
     )
@@ -2646,23 +2938,33 @@ def do_buy_unit(chat_id, user_id, unit_key, qty):
 
 # -------------------------------------------------------------------- دفاع
 
+def air_defense_power(country_id):
+    """قدرت پدافند در بازی؛ عدد کاملاً انتزاعی و مخصوص مکانیک بازی است."""
+    army = get_army(country_id)
+    return sum(ALL_UNITS[k]["power"] * army.get(k, 0) for k in UNIT_CATEGORIES.get("defense", []))
+
+
 def show_defense(chat_id, message_id, user_id):
     c = require_country(user_id)
     if not c:
         return
     army = get_army(c["id"])
-    defense_units = {k: v for k, v in army.items() if k in ("air_defense", "main_tank", "heavy_tank", "air_defense_missile")}
+    dp = air_defense_power(c["id"])
     lines = [
-        f"🛡️ <b>دفاع {c['name']}</b>\n",
-        f"❤️ سلامت کشور: {fmt_num(c['hp'])}/{fmt_num(c['max_hp'])}",
-        f"🪖 روحیه: {fmt_num(c['morale'])}%\n",
-        "واحدهای دفاعی کلیدی:",
+        f"🛡️ <b>دفاع هوایی {c['name']}</b>",
+        f"💪 قدرت پدافندی: {fmt_num(dp)}",
+        "",
+        "سامانه‌های قابل ساخت (هزینه + آهن موردنیاز برای هر عدد):",
     ]
-    for k, v in defense_units.items():
-        lines.append(f"{ALL_UNITS[k]['name']}: {v}")
-    if not defense_units:
-        lines.append("هنوز واحد دفاعی خاصی نساختی؛ از بخش ارتش تانک/پدافند بخر.")
-    render(chat_id, message_id, "\n".join(lines), back_kb())
+    rows = []
+    for key in UNIT_CATEGORIES["defense"]:
+        u = ALL_UNITS[key]
+        qty = army.get(key, 0)
+        req = unit_resource_requirement(key).get("iron", 0)
+        lines.append(f"{u['name']}: {qty} عدد | {fmt_num(u['cost'])} 💰 | ⛏️ آهن {req}")
+        rows.append([(f"🛒 ساخت {u['name']}", f"buyunit:{key}")])
+    rows.append([("🔙 بازگشت", "menu:main")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="defense")
 
 
 # ------------------------------------------------------------------- فناوری
@@ -2684,7 +2986,7 @@ def show_tech_menu(chat_id, message_id, user_id):
         remaining = active["finishes_at"] - int(time.time())
         lines.append(f"\n⏳ تحقیق «{TECH_TREE[active['tech_key']]['name']}» در حال انجام — {remaining//60} دقیقه مانده.")
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="tech")
 
 
 def do_research(chat_id, message_id, user_id, tech_key):
@@ -2716,7 +3018,7 @@ def show_spy_menu(chat_id, message_id, user_id, page=0):
     if nav:
         rows.append(nav)
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "🕵️ کشور هدف رو برای عملیات جاسوسی انتخاب کن:", kb(rows))
+    render(chat_id, message_id, "🕵️ کشور هدف رو برای عملیات جاسوسی انتخاب کن:", kb(rows), section="spy")
 
 
 def show_spy_actions(chat_id, message_id, user_id, target_id):
@@ -2792,7 +3094,7 @@ def show_diplomacy_menu(chat_id, message_id, user_id, page=0):
     if nav:
         rows.append(nav)
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="diplomacy")
 
 
 def show_diplomacy_actions(chat_id, message_id, user_id, target_id):
@@ -2809,7 +3111,6 @@ def show_diplomacy_actions(chat_id, message_id, user_id, target_id):
         [("🚢 پیمان تجاری", f"diploreq:{target_id}:trade_pact")],
         [("💵 کمک مالی", f"aidstart:{target_id}")],
         [("💔 قطع رابطه", f"diplobreak:{target_id}")],
-        [("⚔️ اعلان جنگ", f"wartarget:{target_id}")],
         [("🔙 بازگشت", "menu:diplomacy")],
     ]
     render(chat_id, message_id, text, kb(rows))
@@ -2852,88 +3153,644 @@ def do_send_aid(chat_id, user_id, target_id, amount):
     send_message(chat_id, text)
 
 
+# --------------------------------------------------------------------- حملات جدید
+
+ATTACK_CATEGORY_FA = {"ground": "🪖 زمینی", "air": "✈️ هوایی", "navy": "🚢 دریایی"}
+ATTACK_UNITS = {
+    "ground": UNIT_CATEGORIES["ground"],
+    "air": UNIT_CATEGORIES["air"],
+    "navy": UNIT_CATEGORIES["navy"],
+}
+BOMB_FAST_REQUIREMENTS = {
+    "nuclear_bomb": 3,
+    "tactical_atomic_bomb": 4,
+    "hydrogen_bomb": 5,
+    "neutron_bomb": 6,
+}
+BOMB_FAST_FA = {
+    "nuclear_bomb": "☢️ بمب هسته‌ای",
+    "tactical_atomic_bomb": "☢️ بمب اتم تاکتیکی",
+    "hydrogen_bomb": "☢️ بمب هیدروژنی",
+    "neutron_bomb": "☢️ بمب نوترونی",
+}
+RAW_RESOURCES = ("oil", "gas", "iron", "coal", "uranium", "food", "steel", "copper")
+STRUCTURES = {
+    "school": {"name": "🏫 مدرسه", "cost": 100, "satisfaction": 3},
+    "railway": {"name": "🚆 راه‌آهن", "cost": 200, "satisfaction": 2},
+    "house": {"name": "🏠 خانه", "cost": 100, "satisfaction": 2},
+    "charity": {"name": "❤️ خیریه", "cost": 500, "satisfaction": 6},
+    "road": {"name": "🛣️ جاده", "cost": 200, "satisfaction": 2},
+}
+
+
+def structure_counts(country_id):
+    rows = query("SELECT structure_key, quantity FROM country_structures WHERE country_id=?", (country_id,))
+    return {r["structure_key"]: r["quantity"] for r in rows}
+
+
+def build_structure(country_id, key):
+    if key not in STRUCTURES:
+        return False, "ساختمان نامعتبر."
+    c = get_country(country_id)
+    data = STRUCTURES[key]
+    if c["treasury"] < data["cost"]:
+        return False, f"سکه کافی نیست. هزینه: {data['cost']:,} 💰"
+    execute("UPDATE countries SET treasury=treasury-?, satisfaction=MIN(100, satisfaction+?) WHERE id=?",
+            (data["cost"], data["satisfaction"], country_id))
+    execute("INSERT INTO country_structures(country_id,structure_key,quantity) VALUES(?,?,1) "
+            "ON CONFLICT(country_id,structure_key) DO UPDATE SET quantity=quantity+1",
+            (country_id, key))
+    execute("UPDATE countries SET protest_active=0, protest_started_at=NULL WHERE id=? AND satisfaction>=30", (country_id,))
+    return True, data["cost"]
+
+
+def show_development_menu(chat_id, message_id, user_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    counts = structure_counts(c["id"])
+    lines = [f"🏗️ <b>توسعه و رفاه کشور {c['name']}</b>",
+             f"😊 رضایت مردم: {c['satisfaction']:.0f}%"]
+    if c["protest_active"]:
+        remain = max(0, int((c["protest_started_at"] + 10*3600 - now()) / 3600))
+        lines.append(f"🚨 اعتراضات فعال — حدود {remain} ساعت فرصت داری رضایت را بالا ببری.")
+    lines.append("")
+    for key, data in STRUCTURES.items():
+        lines.append(f"{data['name']}: {counts.get(key,0)} عدد — {data['cost']} 💰 — +{data['satisfaction']} رضایت")
+    rows = [[(f"➕ ساخت {d['name']}", f"build:{k}")] for k,d in STRUCTURES.items()]
+    rows.append([("🔙 بازگشت", "menu:main")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="development")
+
+
+# ------------------------------------------------------------------ جمعیت
+POPULATION_ACTIONS = {
+    "birth_campaign": {"name": "📣 تبلیغ بچه‌دار شدن", "cost": 100, "population": 10000, "satisfaction": 2},
+    "maternity_bed": {"name": "🛏️ تخت 🫦", "cost": 50, "population": 5000, "satisfaction": 1},
+    "birth_aid": {"name": "🤝 کمک مالی به کسانی که بچه‌دار میشن", "cost": 500, "population": 25000, "satisfaction": 5},
+}
+
+def population_action(country_id, key):
+    if key not in POPULATION_ACTIONS:
+        return False, "گزینه جمعیتی نامعتبر."
+    c = get_country(country_id)
+    data = POPULATION_ACTIONS[key]
+    if not c:
+        return False, "کشور پیدا نشد."
+    if c["treasury"] < data["cost"]:
+        return False, f"💵 پول کافی نیست. هزینه: {data['cost']:,} دلار"
+    execute("UPDATE countries SET treasury=treasury-?, population=population+?, satisfaction=MIN(100,satisfaction+?) WHERE id=?",
+            (data["cost"], data["population"], data["satisfaction"], country_id))
+    return True, data
+
+def show_population_menu(chat_id, message_id, user_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    lines = [f"👥 <b>جمعیت {c['name']}</b>",
+             f"👥 جمعیت فعلی: <b>{fmt_num(c['population'])}</b>",
+             f"😊 رضایت مردم: {c['satisfaction']:.0f}%",
+             "",
+             "افزایش رضایت باعث رشد طبیعی بیشتر جمعیت می‌شود."]
+    for k,d in POPULATION_ACTIONS.items():
+        lines.append(f"{d['name']}: {d['cost']:,} دلار — +{d['population']:,} نفر — +{d['satisfaction']} رضایت")
+    rows = [[(f"➕ {d['name']}", f"pop:{k}")] for k,d in POPULATION_ACTIONS.items()]
+    rows.append([("🔙 بازگشت", "menu:main")])
+    render(chat_id,message_id,"\n".join(lines),kb(rows))
+
+
+
+SPORTS = {
+    "football": "⚽ فوتبال",
+    "basketball": "🏀 بسکتبال",
+    "volleyball": "🏐 والیبال",
+    "tennis": "🎾 تنیس",
+    "boxing": "🥊 بوکس",
+    "wrestling": "🤼 کشتی",
+}
+SPORT_UPGRADE_COST = 100
+
+def sports_ensure_country(country_id):
+    for sk in SPORTS:
+        execute("INSERT OR IGNORE INTO sports(country_id,sport_key,level,wins,losses,draws) VALUES(?,?,0,0,0,0)", (country_id, sk))
+
+def sport_row(country_id, sport_key):
+    sports_ensure_country(country_id)
+    return query_one("SELECT * FROM sports WHERE country_id=? AND sport_key=?", (country_id, sport_key))
+
+def sport_strength(country_id, sport_key):
+    r=sport_row(country_id,sport_key)
+    return 100 + int(r["level"])*25
+
+def show_sports(chat_id, message_id, user_id):
+    c=require_country(user_id)
+    if not c:return
+    sports_ensure_country(c["id"])
+    lines=["🏆 <b>بخش ورزش</b>", "هر ارتقا ۱۰۰ طلاست.", "قدرت هر رشته از سطح آن محاسبه می‌شود."]
+    rows=[]
+    for sk,name in SPORTS.items():
+        r=sport_row(c["id"],sk)
+        lines.append(f"{name} | سطح {r['level']} | قدرت {sport_strength(c['id'],sk)} | 🏅 {r['wins']} برد")
+        rows.append([(f"{name} — ارتقا ۱۰۰ طلا",f"sport:upgrade:{sk}"),("⚔️ مسابقه",f"sport:match:{sk}")])
+    rows += [[("🏆 تورنومنت‌ها", "sport:tournaments")],[ ("🏅 المپیک", "sport:olympics") ],[("🔙 بازگشت","menu:main")]]
+    render(chat_id,message_id,"\n".join(lines),kb(rows),section="sports")
+
+def upgrade_sport(chat_id,message_id,user_id,sport_key):
+    c=require_country(user_id)
+    if not c or sport_key not in SPORTS:return
+    if float(c["treasury"]) < SPORT_UPGRADE_COST:
+        render(chat_id,message_id,"❌ برای ارتقای این رشته ۱۰۰ طلا لازم داری.",back_kb("menu:sports"),section="sports"); return
+    execute("UPDATE countries SET treasury=treasury-? WHERE id=?",(SPORT_UPGRADE_COST,c["id"]))
+    sports_ensure_country(c["id"])
+    execute("UPDATE sports SET level=level+1 WHERE country_id=? AND sport_key=?",(c["id"],sport_key))
+    render(chat_id,message_id,f"✅ {SPORTS[sport_key]} ارتقا یافت.\n💰 هزینه: ۱۰۰ طلا",back_kb("menu:sports"),section="sports")
+
+def show_sport_match_targets(chat_id,message_id,user_id,sport_key):
+    c=require_country(user_id)
+    if not c:return
+    rows=[]
+    for o in list_taken_countries():
+        if o["id"]!=c["id"]:
+            rows.append([(f"{o['flag']} {o['name']}",f"sport:play:{sport_key}:{o['id']}")])
+    rows.append([( "🔙 بازگشت", "menu:sports")])
+    render(chat_id,message_id,f"{SPORTS[sport_key]}\nکشور حریف را انتخاب کن:",kb(rows),section="sports")
+
+def play_sport_match(chat_id,message_id,user_id,sport_key,target_id):
+    c=require_country(user_id); t=get_country(target_id)
+    if not c or not t or c["id"]==t["id"]:return
+    if t["owner_id"] is None:
+        render(chat_id,message_id,"❌ این کشور بازیکن ندارد.",back_kb("menu:sports"),section="sports"); return
+    a=sport_strength(c["id"],sport_key); d=sport_strength(t["id"],sport_key)
+    roll=random.random()*max(a+d,1)
+    if abs(a-d)<max(a,d)*0.08:
+        result="draw"; winner=None
+    else:
+        result="win" if roll<a else "loss"; winner=c if result=="win" else t
+    if result=="win":
+        execute("UPDATE sports SET wins=wins+1 WHERE country_id=? AND sport_key=?",(c["id"],sport_key))
+        execute("UPDATE sports SET losses=losses+1 WHERE country_id=? AND sport_key=?",(t["id"],sport_key))
+        text=f"🏆 {c['flag']} {c['name']} در {SPORTS[sport_key]} مقابل {t['flag']} {t['name']} پیروز شد."
+    elif result=="loss":
+        execute("UPDATE sports SET losses=losses+1 WHERE country_id=? AND sport_key=?",(c["id"],sport_key))
+        execute("UPDATE sports SET wins=wins+1 WHERE country_id=? AND sport_key=?",(t["id"],sport_key))
+        text=f"🏆 {t['flag']} {t['name']} در {SPORTS[sport_key]} مقابل {c['flag']} {c['name']} پیروز شد."
+    else:
+        execute("UPDATE sports SET draws=draws+1 WHERE country_id=? AND sport_key=?",(c["id"],sport_key))
+        execute("UPDATE sports SET draws=draws+1 WHERE country_id=? AND sport_key=?",(t["id"],sport_key))
+        text=f"🤝 مسابقه {SPORTS[sport_key]} بین {c['flag']} {c['name']} و {t['flag']} {t['name']} مساوی شد."
+    add_news(text,category="sports")
+    if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,text)
+    render(chat_id,message_id,text,back_kb("menu:sports"),section="sports")
+
+def show_sport_tournaments(chat_id,message_id,user_id):
+    rows=[]; lines=["🏆 <b>تورنومنت‌های ورزشی</b>"]
+    for t in query("SELECT * FROM sports_tournaments WHERE status IN ('registration','active') ORDER BY id DESC LIMIT 10"):
+        n=query_one("SELECT COUNT(*) AS n FROM sports_tournament_members WHERE tournament_id=?",(t["id"],))["n"]
+        lines.append(f"#{t['id']} {SPORTS.get(t['sport_key'],t['sport_key'])} | {t['name']} | {n} کشور | {t['status']}")
+        if t["status"]=="registration": rows.append([(f"➕ عضویت #{t['id']}",f"sport:tjoin:{t['id']}")])
+    rows.append([("🔙 بازگشت","menu:sports")])
+    render(chat_id,message_id,"\n".join(lines) if len(lines)>1 else "🏆 تورنومنت فعالی وجود ندارد.",kb(rows),section="sports")
+
+def join_tournament(chat_id,message_id,user_id,tid):
+    c=require_country(user_id); t=query_one("SELECT * FROM sports_tournaments WHERE id=?",(tid,))
+    if not c or not t:return
+    if t["status"]!="registration":
+        render(chat_id,message_id,"❌ ثبت‌نام این تورنومنت بسته شده.",back_kb("sport:tournaments"),section="sports");return
+    execute("INSERT OR IGNORE INTO sports_tournament_members(tournament_id,country_id,joined_at) VALUES(?,?,?)",(tid,c["id"],now()))
+    render(chat_id,message_id,"✅ کشور تو در تورنومنت ثبت شد.",back_kb("sport:tournaments"),section="sports")
+
+def show_olympics(chat_id,message_id,user_id):
+    rows=[]; lines=["🏅 <b>المپیک</b>"]
+    for o in query("SELECT * FROM olympics ORDER BY id DESC LIMIT 5"):
+        n=query_one("SELECT COUNT(*) AS n FROM olympic_members WHERE olympics_id=?",(o["id"],))["n"]
+        lines.append(f"#{o['id']} {o['name']} | {n} کشور | {o['status']}")
+        if o["status"]=="registration": rows.append([(f"➕ عضویت در المپیک #{o['id']}",f"sport:ojoin:{o['id']}")])
+    rows.append([("🔙 بازگشت","menu:sports")])
+    render(chat_id,message_id,"\n".join(lines) if len(lines)>1 else "🏅 المپیک فعالی وجود ندارد.",kb(rows),section="sports")
+
+def join_olympics(chat_id,message_id,user_id,oid):
+    c=require_country(user_id); o=query_one("SELECT * FROM olympics WHERE id=?",(oid,))
+    if not c or not o:return
+    if o["status"]!="registration":
+        render(chat_id,message_id,"❌ ثبت‌نام المپیک بسته شده.",back_kb("sport:olympics"),section="sports");return
+    execute("INSERT OR IGNORE INTO olympic_members(olympics_id,country_id,joined_at) VALUES(?,?,?)",(oid,c["id"],now()))
+    render(chat_id,message_id,"✅ کشور تو برای المپیک ثبت شد.",back_kb("sport:olympics"),section="sports")
+
+def show_sports_admin(chat_id,message_id):
+    rows=[]
+    for sk,n in SPORTS.items():
+        rows.append([(f"🏆 تورنومنت {n}",f"admin:sportcreate:{sk}")])
+    for t in query("SELECT * FROM sports_tournaments WHERE status IN ('registration','active') ORDER BY id DESC LIMIT 10"):
+        action="admin:tstart:"+str(t["id"]) if t["status"]=="registration" else "admin:tfinish:"+str(t["id"])
+        label="▶️ شروع" if t["status"]=="registration" else "🏁 تعیین قهرمان"
+        rows.append([(f"{label} تورنومنت #{t['id']} — {t['name']}",action)])
+    rows.append([("🏅 ایجاد ثبت‌نام المپیک","admin:olympiccreate")])
+    rows.append([("▶️ شروع المپیک","admin:olympicstart")])
+    rows.append([("🔙 بازگشت","admin:main")])
+    render(chat_id,message_id,"🏆 <b>مدیریت ورزش</b>\n\nبرای هر رشته تورنومنت بساز، ثبت‌نام را شروع کن و سپس مسابقات را اجرا کن.\nالمپیک شامل هر ۶ رشته است.",kb(rows))
+
+def create_sport_tournament_prompt(chat_id,user_id,sport_key):
+    AWAITING[user_id]={"action":"admin_sport_tournament_name","sport_key":sport_key,"chat_id":chat_id}
+    send_message(chat_id,f"نام تورنومنت {SPORTS[sport_key]} را بفرست:")
+
+def create_sport_tournament(user_id,sport_key,name):
+    execute("INSERT INTO sports_tournaments(sport_key,name,status,created_at) VALUES(?,?,?,?)",(sport_key,name,"registration",now()))
+    tid=_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    msg=f"🏆 <b>تورنومنت جدید {SPORTS[sport_key]}</b>\n\n📛 {name}\n\n🌍 ثبت‌نام کشورها آغاز شد!"
+    add_news(msg,category="sports")
+    if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,msg)
+    return tid
+
+
+def run_sport_tournament(chat_id,message_id,tid):
+    t=query_one("SELECT * FROM sports_tournaments WHERE id=?",(tid,))
+    if not t:return
+    members=query("SELECT country_id FROM sports_tournament_members WHERE tournament_id=?",(tid,))
+    ids=[int(x["country_id"]) for x in members]
+    if len(ids)<2:
+        render(chat_id,message_id,"❌ حداقل ۲ کشور برای تورنومنت لازم است.",back_kb("admin:sports")); return
+    execute("UPDATE sports_tournaments SET status='active',started_at=? WHERE id=?",(now(),tid))
+    random.shuffle(ids)
+    while len(ids)>1:
+        a_id=ids.pop(0); b_id=ids.pop(0)
+        a=get_country(a_id); b=get_country(b_id)
+        sa=sport_strength(a_id,t["sport_key"]); sb=sport_strength(b_id,t["sport_key"])
+        winner_id=a_id if random.random() < sa/max(sa+sb,1) else b_id
+        winner=get_country(winner_id)
+        execute("UPDATE sports SET wins=wins+1 WHERE country_id=? AND sport_key=?",(winner_id,t["sport_key"]))
+        loser_id=b_id if winner_id==a_id else a_id
+        execute("UPDATE sports SET losses=losses+1 WHERE country_id=? AND sport_key=?",(loser_id,t["sport_key"]))
+        ids.append(winner_id)
+    winner=get_country(ids[0])
+    execute("UPDATE sports_tournaments SET status='finished',winner_country_id=? WHERE id=?",(winner["id"],tid))
+    msg=f"🏆 <b>قهرمان تورنومنت {SPORTS[t['sport_key']]}</b>\n\n🥇 {winner['flag']} {winner['name']}\n📛 {t['name']}"
+    add_news(msg,category="sports")
+    if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,msg)
+    render(chat_id,message_id,msg,back_kb("admin:sports"))
+
+def start_olympics(chat_id,message_id,user_id):
+    members=query("SELECT country_id FROM olympic_members WHERE olympics_id=(SELECT id FROM olympics WHERE status='registration' ORDER BY id DESC LIMIT 1)")
+    o=query_one("SELECT * FROM olympics WHERE status='registration' ORDER BY id DESC LIMIT 1")
+    if not o:
+        execute("INSERT INTO olympics(name,status,created_at,started_at) VALUES(?,?,?,?)",("المپیک جهانی","active",now(),now()))
+        oid=_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    else:
+        oid=o["id"]; execute("UPDATE olympics SET status='active',started_at=? WHERE id=?",(now(),oid))
+    msg="🏅 <b>المپیک جهانی آغاز شد!</b>\n\n⚽ فوتبال | 🏀 بسکتبال | 🏐 والیبال | 🎾 تنیس | 🥊 بوکس | 🤼 کشتی\n\n🌍 کشورهای ثبت‌نام‌شده آماده مسابقه‌اند."
+    add_news(msg,category="sports")
+    if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,msg)
+    render(chat_id,message_id,msg,back_kb("admin:sports"))
+
+def war_enabled():
+    r=query_one("SELECT value FROM meta WHERE key='war_enabled'")
+    return not r or str(r["value"])!="0"
+
+def set_war_enabled(enabled):
+    execute("INSERT OR REPLACE INTO meta(key,value) VALUES('war_enabled',?)",("1" if enabled else "0",))
+
+WAR_CATEGORY_META = {
+    "ground": "war_ground_enabled",
+    "air": "war_air_enabled",
+    "bomb": "war_bomb_enabled",
+    "navy": "war_navy_enabled",
+}
+WAR_CATEGORY_FA = {
+    "ground": "🪖 زمینی",
+    "air": "✈️ هوایی",
+    "bomb": "💣 بمبی (تسخیر سریع)",
+    "navy": "🚢 دریایی",
+}
+
+def war_category_enabled(category):
+    if not war_enabled():
+        return False
+    key = WAR_CATEGORY_META.get(category)
+    if not key:
+        return True
+    r = query_one("SELECT value FROM meta WHERE key=?", (key,))
+    return True if not r else str(r["value"]) != "0"
+
+def set_war_category_enabled(category, enabled):
+    key = WAR_CATEGORY_META.get(category)
+    if key:
+        execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, "1" if enabled else "0"))
+
+def war_category_gate(chat_id, message_id, category):
+    if war_category_enabled(category):
+        return True
+    msg = f"🔴 {WAR_CATEGORY_FA.get(category, 'این نوع جنگ')} در حال حاضر توسط ادمین غیرفعال شده."
+    render(chat_id, message_id, msg, back_kb("menu:war"), section="war")
+    return False
+
+def notify_country_owner(country_id, text):
+    c = get_country(country_id)
+    if not c or not c["owner_id"]:
+        return
+    try:
+        send_message(c["owner_id"], text)
+    except Exception as e:
+        print(f"[war_notify] خطا در ارسال اعلان به مالک کشور {country_id}: {e}")
+
+def war_gate(chat_id,message_id=None):
+    msg="🔴 جنگ‌ها در حال حاضر توسط ادمین غیرفعال شده‌اند." 
+    if message_id: render(chat_id,message_id,msg,back_kb("menu:main"),section="war")
+    else: send_message(chat_id,msg)
+    return False
+
+
+def show_attack_targets(chat_id, message_id, user_id, attack_type, page=0):
+    c = require_country(user_id)
+    if not c:
+        return
+    others = [x for x in list_taken_countries() if x["id"] != c["id"]]
+    per_page = 6
+    chunk = others[page*per_page:(page+1)*per_page]
+    title = {"fast":"⚡ تسخیر سریع", "ground":"🪖 حمله زمینی", "air":"✈️ حمله هوایی", "navy":"🚢 حمله دریایی"}[attack_type]
+    rows = [[(f"🎯 {o['flag']} {o['name']}", f"atktsel:{attack_type}:{o['id']}")] for o in chunk]
+    nav=[]
+    if page>0: nav.append(("⬅️", f"atkpage:{attack_type}:{page-1}"))
+    if (page+1)*per_page < len(others): nav.append(("➡️", f"atkpage:{attack_type}:{page+1}"))
+    if nav: rows.append(nav)
+    rows.append([("🔙 بازگشت", "menu:war")])
+    render(chat_id, message_id, f"{title}\n\nکشور هدف را انتخاب کن:", kb(rows), section="war")
+
+
+def show_fast_bombs(chat_id, message_id, user_id, target_id):
+    c=require_country(user_id); t=get_country(target_id)
+    if not c or not t: return
+    army=get_army(c["id"])
+    lines=[f"⚡ <b>تسخیر سریع {t['flag']} {t['name']}</b>", "نوع تجهیزات را انتخاب کن:"]
+    rows=[]
+    for key, need in BOMB_FAST_REQUIREMENTS.items():
+        have=army.get(key,0)
+        rows.append([(f"{BOMB_FAST_FA[key]} — نیاز {need} | داری {have}", f"fastdo:{target_id}:{key}")])
+    rows.append([("🔙 بازگشت", "menu:war")])
+    render(chat_id,message_id,"\n".join(lines),kb(rows),section="war")
+
+
+def fast_conquest(attacker_id, defender_id, bomb_key):
+    if attacker_id == defender_id: return False, "نمی‌تونی به خودت حمله کنی."
+    if bomb_key not in BOMB_FAST_REQUIREMENTS: return False, "نوع تجهیزات نامعتبره."
+    attacker=get_country(attacker_id); defender=get_country(defender_id)
+    if not attacker or not defender: return False, "کشور پیدا نشد."
+    rel=get_relation(attacker_id, defender_id)
+    if rel == "alliance": return False, "نمی‌تونی به متحدت حمله کنی؛ اول اتحاد را بشکن."
+    need=BOMB_FAST_REQUIREMENTS[bomb_key]
+    have=get_army(attacker_id).get(bomb_key,0)
+    if have < need:
+        return False, f"❌ مقدار کافی از {BOMB_FAST_FA[bomb_key]} برای تسخیر نداری. نیاز: {need} | موجودی: {have}"
+    execute("UPDATE army SET quantity=quantity-? WHERE country_id=? AND unit_key=?", (need,attacker_id,bomb_key))
+    captured=transfer_all_territories(defender_id, attacker_id)
+    notify_country_owner(defender_id, f"☠️ <b>کشورت به‌طور کامل تسخیر شد!</b>\n\n{attacker['flag']} {attacker['name']} با «تسخیر سریع» کشور {defender['flag']} {defender['name']} را شکست داد و تمام {captured} قلمرو را تصرف کرد.")
+    add_news(f"⚡ {attacker['flag']} {attacker['name']} با عملیات تسخیر سریع، {defender['flag']} {defender['name']} را حذف کرد و {captured} قلمرو را تصرف کرد!", category="destruction")
+    destroy_and_liberate_country(defender_id)
+    execute("UPDATE countries SET wins=wins+1, conquests=conquests+1 WHERE id=?", (attacker_id,))
+    return True, f"تسخیر سریع با {BOMB_FAST_FA[bomb_key]} موفق شد؛ {captured} قلمرو منتقل شد."
+
+
+def category_power(country_id, category):
+    return sum(ALL_UNITS[k]["power"] * q for k,q in get_army(country_id).items() if k in UNIT_CATEGORIES.get(category, []))
+
+
+def apply_category_losses(country_id, category, percent):
+    army=get_army(country_id)
+    for key in UNIT_CATEGORIES.get(category, []):
+        q=army.get(key,0)
+        if q<=0: continue
+        loss=max(0, min(q, int(round(q*percent))))
+        if loss:
+            execute("UPDATE army SET quantity=MAX(0,quantity-?) WHERE country_id=? AND unit_key=?", (loss,country_id,key))
+
+
+def attack_force_power(unit_key, qty):
+    return ALL_UNITS[unit_key]["power"] * qty
+
+
+def resolve_selected_attack(attacker_id, defender_id, category, unit_key, qty, mode):
+    attacker=get_country(attacker_id); defender=get_country(defender_id)
+    if not attacker or not defender: return False, "کشور پیدا نشد."
+    if unit_key not in UNIT_CATEGORIES[category]: return False, "نیروی انتخاب‌شده معتبر نیست."
+    have=get_army(attacker_id).get(unit_key,0)
+    if qty<=0 or have<qty: return False, f"این مقدار نیرو را نداری. موجودی: {have}"
+    atk_power=attack_force_power(unit_key,qty)
+    def_power=category_power(defender_id,category)
+    success=atk_power > max(def_power,1)
+    ratio=atk_power/max(def_power,1)
+    # تلفات انتزاعی بازی: قدرت بیشتر = تلفات کمتر، ولی هیچ حمله‌ای بدون هزینه نیست.
+    atk_loss_pct=max(0.10,min(0.45,0.35-(ratio-1)*0.08))
+    def_loss_pct=max(0.10,min(0.55,0.20+(ratio-1)*0.10)) if success else 0.10
+    atk_loss=max(1,int(round(qty*atk_loss_pct)))
+    execute("UPDATE army SET quantity=MAX(0,quantity-?) WHERE country_id=? AND unit_key=?", (atk_loss,attacker_id,unit_key))
+    apply_category_losses(defender_id,category,def_loss_pct)
+    if not success:
+        return False, f"حمله موفق نشد. قدرت مهاجم: {atk_power:,} | قدرت دفاع: {def_power:,} | تلفات نیروی مهاجم: {atk_loss}"
+    if mode == "capture":
+        defender_owner = defender["owner_id"]
+        terr=capture_random_territory(attacker_id,defender_id)
+        remaining = territory_count(defender_id)
+        if terr and remaining > 0:
+            msg=f"یک قلمرو به نام «{terr['name']}» به کشور تو منتقل شد."
+            notify_country_owner(defender_id, f"🚨 <b>به کشور تو حمله شد!</b>\n\n{attacker['flag']} {attacker['name']} یک حمله زمینی انجام داد و قلمرو «{terr['name']}» را از تو گرفت.\n🗺️ قلمروهای باقی‌مانده: {remaining}")
+        else:
+            captured_total = remaining
+            if captured_total > 0:
+                transfer_all_territories(defender_id,attacker_id)
+            notify_country_owner(defender_id, f"☠️ <b>کشورت تسخیر شد!</b>\n\n{attacker['flag']} {attacker['name']} آخرین قلمروهای {defender['flag']} {defender['name']} را تصرف کرد و کشور تو سقوط کرد.")
+            destroy_and_liberate_country(defender_id)
+            msg="آخرین قلمرو هم تصرف شد و کشور هدف حذف شد."
+        add_news(f"🪖 {attacker['flag']} {attacker['name']} با حمله زمینی بخشی از قلمرو {defender['flag']} {defender['name']} را تصرف کرد.", category="war_win")
+        return True, f"فتح موفق شد. {msg} تلفات نیروی مهاجم: {atk_loss}"
+    # theft
+    stolen_money=max(0,int(defender["treasury"]*0.10))
+    execute("UPDATE countries SET treasury=MAX(0,treasury-?) WHERE id=?",(stolen_money,defender_id))
+    execute("UPDATE countries SET treasury=treasury+? WHERE id=?",(stolen_money,attacker_id))
+    stolen=[]
+    for r in RAW_RESOURCES:
+        stock=get_resources(defender_id).get(r,0)
+        amount=int(stock*0.10)
+        if amount>0:
+            add_resource(defender_id,r,-amount); add_resource(attacker_id,r,amount); stolen.append(f"{RESOURCE_FA[r]} {amount}")
+    return True, f"دزدی موفق شد. 💰 {stolen_money:,} سکه و {', '.join(stolen) if stolen else 'مقدار کمی از منابع'} منتقل شد. تلفات مهاجم: {atk_loss}"
+
+
+def show_attack_units(chat_id,message_id,user_id,attack_type,target_id,submode=None):
+    c=require_country(user_id); t=get_country(target_id)
+    if not c or not t: return
+    category=attack_type
+    army=get_army(c["id"])
+    lines=[f"{ATTACK_CATEGORY_FA[category]} علیه {t['flag']} {t['name']}","نیروی مورد استفاده را انتخاب کن:"]
+    rows=[]
+    for key in UNIT_CATEGORIES[category]:
+        have=army.get(key,0)
+        if have>0:
+            rows.append([(f"{ALL_UNITS[key]['name']} — موجودی {have}",f"atkunit:{attack_type}:{target_id}:{key}:{submode or 'capture'}")])
+    if not rows: lines.append("❌ از این نوع نیرو چیزی نداری.")
+    rows.append([("🔙 بازگشت",f"atktsel:{attack_type}:{target_id}")])
+    render(chat_id,message_id,"\n".join(lines),kb(rows),section="war")
+
+
+def ask_attack_quantity(chat_id,message_id,user_id,attack_type,target_id,unit_key,mode):
+    c=require_country(user_id)
+    if not c: return
+    have=get_army(c["id"]).get(unit_key,0)
+    AWAITING[user_id]={"action":"attack_qty","attack_type":attack_type,"target_id":target_id,"unit_key":unit_key,"mode":mode,"chat_id":chat_id}
+    render(chat_id,message_id,f"⚔️ {ALL_UNITS[unit_key]['name']}\nموجودی: {have}\n\nچند عدد را وارد حمله کن؟",back_kb("menu:war"),section="war")
+
+
+def do_attack_quantity(chat_id,user_id,pending,qty):
+    c=require_country(user_id)
+    if not c: return
+    if pending["attack_type"]=="air":
+        if pending["mode"]=="leaders": ok,res=air_leader_attack(c["id"],pending["target_id"],pending["unit_key"],qty)
+        else: ok,res=air_industry_attack(c["id"],pending["target_id"],pending["unit_key"],qty,pending["mode"]=="random")
+    elif pending["attack_type"]=="navy" and pending["mode"]=="blockade":
+        ok,res=start_blockade(c["id"],pending["target_id"],pending["unit_key"],qty)
+    else:
+        ok,res=resolve_selected_attack(c["id"],pending["target_id"],pending["attack_type"],pending["unit_key"],qty,pending["mode"])
+    send_message(chat_id,("✅ " if ok else "⛔ ")+res)
+    attacker=get_country(c["id"]); defender=get_country(pending["target_id"])
+    if attacker and defender:
+        icon={"ground":"🪖","air":"✈️","navy":"🚢"}.get(pending["attack_type"],"⚔️")
+        notify_country_owner(defender["id"], f"🚨 <b>به کشور تو حمله شد!</b>\n\n{icon} {attacker['flag']} {attacker['name']} علیه {defender['flag']} {defender['name']} عملیات انجام داد.\n📌 عملیات: {pending['mode']}\n📊 نتیجه: {'موفق' if ok else 'ناموفق'}\n⚔️ {res}")
+        channel_text=f"{icon} <b>گزارش حمله</b>\n\n🌍 {attacker['flag']} {attacker['name']} → {defender['flag']} {defender['name']}\n📌 عملیات: {pending['mode']}\n📊 نتیجه: {'موفق' if ok else 'ناموفق'}\n⚔️ {res}"
+        add_news(channel_text,category="war")
+        if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,channel_text)
+
+
+def show_air_attack_types(chat_id,message_id,user_id,target_id):
+    t=get_country(target_id)
+    if not t:return
+    rows=[[("🎯 ترور رهبران",f"airmode:{target_id}:leaders")],[("🏭 حمله به معادن و کارخانه‌ها",f"airmode:{target_id}:industry")],[("💥 حمله بی‌هدف",f"airmode:{target_id}:random")],[("🔙 بازگشت","menu:war")]]
+    render(chat_id,message_id,f"✈️ حمله هوایی به {t['flag']} {t['name']}\n\nنوع حمله را انتخاب کن:",kb(rows),section="war")
+
+
+def air_leader_attack(attacker_id,defender_id,unit_key,qty):
+    attacker=get_country(attacker_id); defender=get_country(defender_id)
+    have=get_army(attacker_id).get(unit_key,0)
+    if have<qty or qty<=0:return False,"مقدار نیروی هوایی کافی نیست."
+    atk_power=attack_force_power(unit_key,qty); def_power=max(category_power(defender_id,"air"),1)
+    defense_power=air_defense_power(defender_id)
+    if defense_power >= atk_power:
+        loss=max(1,int(round(qty*0.10)))
+        execute("UPDATE army SET quantity=MAX(0,quantity-?) WHERE country_id=? AND unit_key=?",(loss,attacker_id,unit_key))
+        return False,f"🛡️ حمله هوایی دفع شد. قدرت پدافند: {defense_power:,} | قدرت حمله: {atk_power:,}"
+    effective_power=max(1, atk_power-defense_power)
+    pct=min(100,max(1,round(effective_power/def_power*100)))
+    old=defender["leaders"]
+    killed=max(1,round(old*pct/100)) if pct<100 else old
+    new=max(0,old-killed)
+    execute("UPDATE army SET quantity=MAX(0,quantity-?) WHERE country_id=? AND unit_key=?",(max(1,int(qty*0.12)),attacker_id,unit_key))
+    execute("UPDATE countries SET leaders=? WHERE id=?",(new,defender_id))
+    notify_country_owner(defender_id, f"🚨 <b>به کشور تو حمله هوایی شد!</b>\n\n{attacker['flag']} {attacker['name']} به {defender['flag']} {defender['name']} حمله هوایی کرد.")
+    add_news(f"✈️ {attacker['flag']} {attacker['name']} به {defender['flag']} {defender['name']} حمله هوایی کرد.",category="war_win")
+    if new<=0:
+        add_news(f"⚠️ تمام رهبران {defender['flag']} {defender['name']} حذف شدند و قدرت نظامی کشور به صفر رسید.",category="destruction")
+    return True,f"حمله انجام شد. حدود {pct}% از رهبران هدف حذف شدند. رهبران باقی‌مانده: {new}."
+
+
+def air_industry_attack(attacker_id,defender_id,unit_key,qty,random_mode=False):
+    attacker=get_country(attacker_id); defender=get_country(defender_id)
+    have=get_army(attacker_id).get(unit_key,0)
+    if have<qty or qty<=0:return False,"مقدار نیروی هوایی کافی نیست."
+    atk_power=attack_force_power(unit_key,qty); def_power=max(category_power(defender_id,"air"),1)
+    defense_power=air_defense_power(defender_id)
+    if defense_power >= atk_power:
+        loss=max(1,int(round(qty*0.10)))
+        execute("UPDATE army SET quantity=MAX(0,quantity-?) WHERE country_id=? AND unit_key=?",(loss,attacker_id,unit_key))
+        return False,f"🛡️ حمله هوایی دفع شد. قدرت پدافند: {defense_power:,} | قدرت حمله: {atk_power:,}"
+    effective_power=max(1, atk_power-defense_power)
+    ratio=effective_power/def_power
+    count=max(1,min(8,int(round(1+ratio*2))))
+    rows=list_factories(defender_id)
+    if random_mode:
+        rows=rows
+    destroyed=min(len(rows),count)
+    for f in rows[:destroyed]: execute("DELETE FROM factories WHERE id=?",(f["id"],))
+    structures=structure_counts(defender_id)
+    if random_mode:
+        for key in list(structures):
+            if structures[key]>0 and random.random()<min(0.7,0.15+ratio*0.1):
+                execute("UPDATE country_structures SET quantity=MAX(0,quantity-1) WHERE country_id=? AND structure_key=?",(defender_id,key))
+    execute("UPDATE army SET quantity=MAX(0,quantity-?) WHERE country_id=? AND unit_key=?",(max(1,int(qty*0.12)),attacker_id,unit_key))
+    notify_country_owner(defender_id, f"🚨 <b>به کشور تو حمله هوایی شد!</b>\n\n{attacker['flag']} {attacker['name']} به تأسیسات {defender['flag']} {defender['name']} حمله کرد؛ {destroyed} کارخانه/معدن از بین رفت.")
+    add_news(f"✈️ {attacker['flag']} {attacker['name']} به تأسیسات {defender['flag']} {defender['name']} حمله کرد؛ {destroyed} کارخانه/معدن از بین رفت.",category="destruction")
+    return True,f"حمله انجام شد. 🏭 {destroyed} کارخانه/معدن نابود شد."
+
+
+def show_navy_units_for_blockade(chat_id,message_id,user_id,target_id):
+    show_attack_units(chat_id,message_id,user_id,"navy",target_id,"blockade")
+
+
+def start_blockade(attacker_id,defender_id,unit_key,qty):
+    attacker=get_country(attacker_id); defender=get_country(defender_id)
+    have=get_army(attacker_id).get(unit_key,0)
+    if have<qty or qty<=0:return False,"مقدار نیروی دریایی کافی نیست."
+    existing=query_one("SELECT id FROM blockades WHERE defender_id=? AND status='active'",(defender_id,))
+    if existing:return False,"این کشور همین الان در محاصره دریایی است."
+    power=attack_force_power(unit_key,qty)
+    execute("INSERT INTO blockades(attacker_id,defender_id,naval_power,status,started_at) VALUES(?,?,?,'active',?)",(attacker_id,defender_id,power,now()))
+    notify_country_owner(defender_id, f"🚨 <b>کشورت مورد حمله دریایی قرار گرفت!</b>\n\n{attacker['flag']} {attacker['name']} کشور {defender['flag']} {defender['name']} را محاصره دریایی کرد.")
+    add_news(f"🚢 {attacker['flag']} {attacker['name']} کشور {defender['flag']} {defender['name']} را محاصره دریایی کرد.")
+    return True,f"محاصره دریایی برقرار شد. قدرت محاصره: {power:,}"
+
+
+def show_break_blockade(chat_id,message_id,user_id,blockade_id):
+    b=query_one("SELECT * FROM blockades WHERE id=? AND status='active'",(blockade_id,))
+    c=require_country(user_id)
+    if not b or not c or b["defender_id"]!=c["id"]: return
+    rows=[]
+    for key in UNIT_CATEGORIES["navy"]:
+        have=get_army(c["id"]).get(key,0)
+        if have: rows.append([(f"{ALL_UNITS[key]['name']} — {have}",f"breakunit:{blockade_id}:{key}")])
+    rows.append([("🔙 بازگشت","menu:war")])
+    render(chat_id,message_id,f"🛡️ <b>شکستن محاصره</b>\nقدرت محاصره‌کننده: {b['naval_power']:,}\n\nنیروی دریایی خودت را انتخاب کن:",kb(rows),section="war")
+
+
+def break_blockade(attacker_id,blockade_id,unit_key,qty):
+    b=query_one("SELECT * FROM blockades WHERE id=? AND status='active'",(blockade_id,))
+    if not b or b["defender_id"]!=attacker_id:return False,"محاصره فعال نیست."
+    have=get_army(attacker_id).get(unit_key,0)
+    if have<qty or qty<=0:return False,"مقدار نیروی دریایی کافی نیست."
+    power=attack_force_power(unit_key,qty)
+    loss=max(1,int(qty*0.10))
+    execute("UPDATE army SET quantity=MAX(0,quantity-?) WHERE country_id=? AND unit_key=?",(loss,attacker_id,unit_key))
+    if power>b["naval_power"]:
+        execute("UPDATE blockades SET status='ended',ended_at=? WHERE id=?",(now(),blockade_id))
+        add_news(f"🛡️ {get_country(attacker_id)['flag']} {get_country(attacker_id)['name']} محاصره دریایی را شکست.")
+        return True,"محاصره شکسته شد و تجارت دوباره آزاد شد."
+    return False,f"قدرت نیروی تو ({power:,}) برای شکستن محاصره ({b['naval_power']:,}) کافی نیست."
+
+
+def check_protests():
+    rows=query("SELECT * FROM countries WHERE owner_id IS NOT NULL AND active=1 AND (is_special IS NULL OR is_special=0)")
+    for c in rows:
+        if c["satisfaction"] < 30:
+            if not c["protest_active"]:
+                execute("UPDATE countries SET protest_active=1, protest_started_at=? WHERE id=?",(now(),c["id"]))
+                add_news(f"🚨 در {c['flag']} {c['name']} به‌دلیل رضایت کمتر از ۳۰٪ اعتراضات آغاز شد.")
+            elif c["protest_started_at"] and now()-c["protest_started_at"] >= 10*3600:
+                add_news(f"⚠️ اعتراضات در {c['flag']} {c['name']} پس از ۱۰ ساعت بدون بهبود کافی، به سقوط کشور منجر شد.",category="destruction")
+                destroy_and_liberate_country(c["id"])
+        elif c["protest_active"]:
+            execute("UPDATE countries SET protest_active=0, protest_started_at=NULL WHERE id=?",(c["id"],))
+
+
 # --------------------------------------------------------------------- جنگ
 
 def show_war_menu(chat_id, message_id, user_id, page=0):
     c = require_country(user_id)
-    if not c:
-        return
-    active_wars = query(
-        "SELECT * FROM wars WHERE status='active' AND (attacker_id=? OR defender_id=?)",
-        (c["id"], c["id"]),
-    )
-    lines = ["⚔️ <b>جنگ</b>\n"]
-    rows = []
-    if active_wars:
-        lines.append("🔥 جنگ‌های فعال:")
-        for w in active_wars:
-            other_id = w["defender_id"] if w["attacker_id"] == c["id"] else w["attacker_id"]
-            other = get_country(other_id)
-            lines.append(f"  در حال جنگ با {other['flag']} {other['name']}")
-            rows.append([(f"💥 حمله به {other['name']}", f"battle:{w['id']}")])
-    others = [x for x in list_taken_countries() if x["id"] != c["id"]]
-    per_page = 6
-    chunk = others[page*per_page:(page+1)*per_page]
-    for o in chunk:
-        rel = get_relation(c["id"], o["id"])
-        if rel != "war":
-            rows.append([(f"⚔️ اعلان جنگ به {o['flag']} {o['name']}", f"wartarget:{o['id']}")])
-    nav = []
-    if page > 0:
-        nav.append(("⬅️", f"warpage:{page-1}"))
-    if (page+1)*per_page < len(others):
-        nav.append(("➡️", f"warpage:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
-
-
-def confirm_war(chat_id, message_id, user_id, target_id):
-    c = require_country(user_id)
-    t = get_country(target_id)
-    if not c or not t:
-        return
-    rel = get_relation(c["id"], target_id)
-    if rel == "alliance":
-        render(chat_id, message_id, "⛔ نمی‌تونی به متحدت اعلان جنگ بدی؛ اول باید اتحاد رو بشکنی.", back_kb("menu:war"))
-        return
-    text = f"⚠️ آیا مطمئنی می‌خوای به {t['flag']} {t['name']} اعلان جنگ بدی؟"
-    render(chat_id, message_id, text, confirm_kb(f"declarewar:{target_id}", "menu:war"))
-
-
-def do_declare_war(chat_id, message_id, user_id, target_id):
-    c = require_country(user_id)
-    if not c:
-        return
-    ok, res = declare_war(c["id"], target_id)
-    text = "⚔️ جنگ اعلام شد!" if ok else f"⛔ {res}"
-    render(chat_id, message_id, text, back_kb("menu:war"))
-
-
-def do_battle_round(chat_id, message_id, user_id, war_id):
-    c = require_country(user_id)
-    war = query_one("SELECT * FROM wars WHERE id=?", (war_id,))
-    if not c or not war or c["id"] not in (war["attacker_id"], war["defender_id"]):
-        return
-    result = resolve_battle(war_id)
-    if not result:
-        render(chat_id, message_id, "این جنگ دیگه فعال نیست.", back_kb("menu:war"))
-        return
-    lines = [
-        "💥 <b>نتیجه‌ی نبرد</b>",
-        f"آسیب به مدافع: {fmt_num(result['dmg_to_defender'])}",
-        f"آسیب به مهاجم: {fmt_num(result['dmg_to_attacker'])}",
+    if not c: return
+    lines=["⚔️ <b>مرکز حملات</b>","نوع عملیات را انتخاب کن:"]
+    rows=[
+        [("⚡ تسخیر سریع", "atk:fast")],
+        [("🪖 حمله زمینی", "atk:ground")],
+        [("✈️ حمله هوایی", "atk:air")],
+        [("🚢 حمله دریایی", "atk:navy")],
     ]
-    if result["ended"]:
-        lines.append(f"🏁 جنگ به پایان رسید. برنده: {result['winner']}")
-        rows = [[("🔙 بازگشت", "menu:war")]]
-    else:
-        rows = [[("💥 حمله دوباره", f"battle:{war_id}")], [("🔙 بازگشت", "menu:war")]]
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
+    for b in query("SELECT * FROM blockades WHERE defender_id=? AND status='active'",(c["id"],)):
+        rows.append([("🛡️ شکستن محاصره دریایی",f"break:{b['id']}")])
+    rows.append([("🔙 بازگشت", "menu:main")])
+    render(chat_id,message_id,"\n".join(lines),kb(rows),section="war")
 
-
-# ------------------------------------------------------------------- سرزمین
 
 def show_territory_menu(chat_id, message_id, user_id):
     c = require_country(user_id)
@@ -2948,13 +3805,44 @@ def show_territory_menu(chat_id, message_id, user_id):
         lines.append("هنوز سرزمینی نداری.")
     straits = list_straits()
     lines.append("\n🌊 <b>تنگه‌های استراتژیک جهان:</b>")
+    rows = []
     for s in straits:
         owner_txt = "آزاد"
         if s["owner_id"]:
             oc = get_country(s["owner_id"])
             owner_txt = f"{oc['flag']} {oc['name']}"
-        lines.append(f"• {s['name']} — مالک: {owner_txt}")
-    render(chat_id, message_id, "\n".join(lines), back_kb())
+        cost = capture_cost(s["strategic_value"])
+        state_txt = "🔴 بسته" if int(s["is_closed"] or 0) else "🟢 باز"
+        lines.append(f"• {s['name']} — مالک: {owner_txt} — وضعیت: {state_txt} — هزینه‌ی عملیات تصرف: {fmt_num(cost)} 💰")
+        if s["owner_id"] == c["id"]:
+            rows.append([(f"{'🔓 باز کردن' if s['is_closed'] else '🔒 بستن'} {s['name']}", f"togglestrait:{s['id']}")])
+        else:
+            rows.append([(f"⚔️ تلاش برای تصرف {s['name']}", f"capturestrait:{s['id']}")])
+    rows.append([("🔙 بازگشت", "menu:main")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="territory")
+
+
+def confirm_capture_strait(chat_id, message_id, user_id, territory_id):
+    t = query_one("SELECT * FROM territories WHERE id=?", (territory_id,))
+    if not t:
+        return
+    cost = capture_cost(t["strategic_value"])
+    text = (
+        f"⚔️ تلاش برای تصرف «{t['name']}»\n"
+        f"هزینه‌ی عملیات: {fmt_num(cost)} 💰 (چه موفق بشی چه نشی، این هزینه کسر می‌شه)\n"
+        "شانس موفقیت به قدرت نظامیت نسبت به اهمیت استراتژیک این تنگه بستگی داره.\n\n"
+        "ادامه بدی؟"
+    )
+    render(chat_id, message_id, text, confirm_kb(f"docapturestrait:{territory_id}", "menu:territory"))
+
+
+def do_capture_strait(chat_id, message_id, user_id, territory_id):
+    c = require_country(user_id)
+    if not c:
+        return
+    ok, res = attempt_capture_strait(c["id"], territory_id)
+    icon = "✅" if ok else "❌"
+    render(chat_id, message_id, f"{icon} {res}", back_kb("menu:territory"))
 
 
 # --------------------------------------------------------------------- تجارت
@@ -2967,14 +3855,14 @@ def show_trade_menu(chat_id, message_id, user_id):
     lines = ["🚢 <b>بازار جهانی</b>\n"]
     rows = []
     for r in RESOURCES:
-        m = market.get(r, {"price": RESOURCE_BASE_PRICE[r]})
-        lines.append(f"{RESOURCE_FA[r]}: {m['price']:.1f} 💰 / واحد")
+        price = resource_market_price(r)
+        lines.append(f"{RESOURCE_FA[r]}: {price:.1f} 💰 / واحد")
         rows.append([
             (f"🛒 خرید {RESOURCE_FA[r]}", f"buyres:{r}"),
             (f"💰 فروش {RESOURCE_FA[r]}", f"sellres:{r}"),
         ])
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="trade")
 
 
 def ask_trade_amount(chat_id, message_id, user_id, resource, action):
@@ -3006,7 +3894,7 @@ def show_news(chat_id, message_id, user_id):
         lines.append(f"• {n['text']}")
     if not news:
         lines.append("هنوز خبری منتشر نشده.")
-    render(chat_id, message_id, "\n".join(lines), back_kb())
+    render(chat_id, message_id, "\n".join(lines), back_kb(), section="news")
 
 
 def ask_statement(chat_id, message_id, user_id):
@@ -3035,37 +3923,37 @@ def show_ranking_menu(chat_id, message_id, user_id):
         [("👑 رتبه کلی قدرت", "rank:overall")],
         [("🔙 بازگشت", "menu:main")],
     ]
-    render(chat_id, message_id, "🏆 <b>رتبه‌بندی جهانی</b>\nیک دسته رو انتخاب کن:", kb(rows))
+    render(chat_id, message_id, "🏆 <b>رتبه‌بندی جهانی</b>\nیک دسته رو انتخاب کن:", kb(rows), section="ranking")
 
 
 def show_ranking(chat_id, message_id, user_id, rtype):
     lines = ["🏆 <b>نتایج رتبه‌بندی</b>\n"]
     if rtype == "wealth":
         for i, c in enumerate(top_wealth(), 1):
-            lines.append(f"{i}. {c['flag']} {c['name']} — {fmt_num(c['treasury'])} 💰")
+            lines.append(f"{rank_prefix(i)} {c['flag']} {c['name']} — {fmt_num(c['treasury'])} 💰")
     elif rtype == "military":
         for i, (c, p) in enumerate(top_military(), 1):
-            lines.append(f"{i}. {c['flag']} {c['name']} — قدرت {fmt_num(p)}")
+            lines.append(f"{rank_prefix(i)} {c['flag']} {c['name']} — قدرت {fmt_num(p)}")
     elif rtype == "territory":
         for i, (c, n) in enumerate(top_territory(), 1):
-            lines.append(f"{i}. {c['flag']} {c['name']} — {n} منطقه")
+            lines.append(f"{rank_prefix(i)} {c['flag']} {c['name']} — {n} منطقه")
     elif rtype == "industry":
         for i, row in enumerate(top_industry(), 1):
             c = get_country(row["country_id"])
-            lines.append(f"{i}. {c['flag']} {c['name']} — {row['n']} کارخانه")
+            lines.append(f"{rank_prefix(i)} {c['flag']} {c['name']} — {row['n']} کارخانه")
     elif rtype == "tech":
         for i, row in enumerate(top_tech(), 1):
             c = get_country(row["country_id"])
-            lines.append(f"{i}. {c['flag']} {c['name']} — مجموع سطح {row['total']}")
+            lines.append(f"{rank_prefix(i)} {c['flag']} {c['name']} — مجموع سطح {row['total']}")
     elif rtype == "wins":
         for i, c in enumerate(top_wins(), 1):
-            lines.append(f"{i}. {c['flag']} {c['name']} — {c['wins']} پیروزی")
+            lines.append(f"{rank_prefix(i)} {c['flag']} {c['name']} — {c['wins']} پیروزی")
     elif rtype == "overall":
         for i, (c, s) in enumerate(top_overall_power(), 1):
-            lines.append(f"{i}. {c['flag']} {c['name']} — امتیاز {fmt_num(s)}")
+            lines.append(f"{rank_prefix(i)} {c['flag']} {c['name']} — امتیاز {fmt_num(s)}")
     if len(lines) == 1:
         lines.append("هنوز داده‌ای وجود نداره.")
-    render(chat_id, message_id, "\n".join(lines), back_kb("menu:ranking"))
+    render(chat_id, message_id, "\n".join(lines), back_kb("menu:ranking"), section="ranking")
 
 
 # --------------------------------------------------------------------- گزارش
@@ -3095,20 +3983,67 @@ def show_report(chat_id, message_id, user_id):
         f"🤝 متحدان: {len(allies)}\n"
         f"💢 دشمنان: {len(enemies)}\n"
     )
-    render(chat_id, message_id, text, back_kb())
+    render(chat_id, message_id, text, back_kb(), section="report")
 
 
 # -------------------------------------------------------------------- تنظیمات
 
+COUNTRY_INFO_FIELDS = {
+    "capital": "🏛️ پایتخت", "currency": "💱 ارز",
+    "ground_commander": "🪖 فرمانده نیرو زمینی", "air_commander": "✈️ فرمانده نیرو هوایی",
+    "navy_commander": "🚢 فرمانده نیرو دریایی", "nuclear_commander": "☢️ فرمانده نیرو اتمی",
+    "army_name": "🛡️ ارتش", "president": "👤 رئیس جمهور", "minister": "📋 وزیر",
+}
+GOVERNMENT_TYPES = ["جمهوری", "پادشاهی", "سلطنت مشروطه", "جمهوری پارلمانی", "جمهوری ریاستی", "فدرال", "امپراتوری", "شورای نظامی", "دولت موقت", "کنفدراسیون"]
+
+def show_country_info_settings(chat_id, message_id, user_id):
+    c=require_country(user_id)
+    if not c: return
+    lines=["🏠 <b>پنل اطلاعات کشور</b>", ""]
+    for k,label in COUNTRY_INFO_FIELDS.items():
+        lines.append(f"{label}: {c[k] or '—'}")
+    lines.append(f"🏛️ نوع حکومت: {c['government_type'] or '—'}")
+    rows=[[ (f"✏️ {label}", f"cinfo:{k}") ] for k,label in COUNTRY_INFO_FIELDS.items()]
+    rows.append([("🏛️ انتخاب نوع حکومت", "cinfo:government")])
+    rows.append([("🔙 بازگشت", "menu:settings")])
+    render(chat_id,message_id,"\n".join(lines),kb(rows))
+
+def ask_country_info_field(chat_id,message_id,user_id,key):
+    if key not in COUNTRY_INFO_FIELDS: return
+    AWAITING[user_id]={"action":"country_info_field","field":key,"chat_id":chat_id}
+    render(chat_id,message_id,f"✏️ مقدار جدید برای {COUNTRY_INFO_FIELDS[key]} را بفرست.",back_kb("settings:countryinfo"))
+
+def show_government_types(chat_id,message_id,user_id):
+    rows=[[(g,f"gov:{i}")] for i,g in enumerate(GOVERNMENT_TYPES)]
+    rows.append([("🔙 بازگشت","settings:countryinfo")])
+    render(chat_id,message_id,"🏛️ <b>نوع حکومت کشور را انتخاب کن:</b>",kb(rows))
+
+def set_government_type(chat_id,message_id,user_id,index):
+    c=require_country(user_id)
+    if not c or not 0<=index<len(GOVERNMENT_TYPES): return
+    g=GOVERNMENT_TYPES[index]
+    execute("UPDATE countries SET government_type=? WHERE id=?",(g,c["id"]))
+    show_country_info_settings(chat_id,message_id,user_id)
+
+
 def show_settings(chat_id, message_id, user_id):
+    c = get_country_by_owner(user_id)
+    lines = ["⚙️ <b>تنظیمات و ابزارهای کشور</b>"]
+    if c:
+        lines.append(f"{c['flag']} کشور فعلی: <b>{c['name']}</b>")
+    lines.append("━━━━━━━━━━━━")
+    lines.append("از اینجا می‌تونی بیانیه‌ی رسمی منتشر کنی، وضعیت اقتصادی‌ت رو مدیریت کنی یا گزارش کامل کشورت رو ببینی.")
+
     rows = [
         [("📰 انتشار بیانیه رسمی", "statement:new")],
-        [("💰 مشاهده اقتصاد", "menu:economy")],
+        [("🏠 پنل اطلاعات کشور", "settings:countryinfo")],
+        [("💰 اقتصاد و بودجه", "menu:economy"), ("📊 گزارش کامل کشور", "menu:report")],
+        [("🏆 رتبه‌بندی جهانی", "menu:ranking"), ("🏛️ سازمان ملل", "menu:un")],
     ]
     if user_id in ADMIN_IDS:
-        rows.append([("👑 پنل ادمین", "admin:main")])
-    rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "⚙️ <b>تنظیمات کشور</b>", kb(rows))
+        rows.append([("👑 پنل مدیریت ادمین", "admin:main")])
+    rows.append([("🔙 بازگشت به منوی اصلی", "menu:main")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="settings")
 
 
 # -------------------------------------------------------------------- فروشگاه
@@ -3147,7 +4082,7 @@ def show_un_menu(chat_id, message_id, user_id):
     else:
         lines.append("فعلاً قطعنامه‌ی در حال رای‌گیری‌ای نیست.")
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="un")
 
 
 def do_un_join(chat_id, message_id, user_id):
@@ -3240,7 +4175,7 @@ def show_alliance_menu(chat_id, message_id, user_id):
                 rows.append([(f"📋 درخواست‌های عضویت ({len(pending)})", "alliance:requests")])
         rows.append([("🚪 ترک اتحاد", "alliance:leave")])
         rows.append([("🔙 بازگشت", "menu:main")])
-        render(chat_id, message_id, "\n".join(lines), kb(rows))
+        render(chat_id, message_id, "\n".join(lines), kb(rows), section="alliance")
     else:
         alliances = list_alliances()
         lines = ["🏰 <b>اتحادها</b>\nتو عضو هیچ اتحادی نیستی.\n"]
@@ -3253,7 +4188,7 @@ def show_alliance_menu(chat_id, message_id, user_id):
                 lines.append(f"«{al['name']}» — لیدر: {leader_c['flag']} {leader_c['name']} ({member_n} عضو)")
                 rows.append([(f"🚪 درخواست عضویت در «{al['name']}»", f"alliance:join:{al['id']}")])
         rows.append([("🔙 بازگشت", "menu:main")])
-        render(chat_id, message_id, "\n".join(lines), kb(rows))
+        render(chat_id, message_id, "\n".join(lines), kb(rows), section="alliance")
 
 
 def ask_alliance_create(chat_id, message_id, user_id):
@@ -3372,7 +4307,7 @@ def show_shop_menu(chat_id, message_id, user_id):
         lines.append(f"{pack['name']}: {pack_contents_text(pack)}")
         rows.append([(f"{pack['name']} — {PACK_PRICE_TOMAN:,} تومان", f"buypack:{key}")])
     rows.append([("🔙 بازگشت", "menu:main")])
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
+    render(chat_id, message_id, "\n".join(lines), kb(rows), section="shop")
 
 
 def do_buy_pack(chat_id, message_id, user_id, pack_key):
@@ -3455,6 +4390,18 @@ def handle_callback(chat_id, message_id, user_id, username, cb_data, callback_id
         show_resources(chat_id, message_id, user_id)
     elif cb_data == "menu:factory":
         show_factory_menu(chat_id, message_id, user_id)
+    elif cb_data == "menu:development":
+        show_development_menu(chat_id, message_id, user_id)
+    elif cb_data == "menu:population":
+        show_population_menu(chat_id,message_id,user_id)
+    elif action == "pop":
+        c=require_country(user_id)
+        if c:
+            ok,res=population_action(c["id"],parts[1])
+            render(chat_id,message_id,(f"✅ {res['name']} انجام شد. +{res['population']:,} نفر به جمعیت اضافه شد." if ok else f"⛔ {res}"),back_kb("menu:population"))
+    elif action == "build":
+        ok,res=build_structure(require_country(user_id)["id"],parts[1])
+        render(chat_id,message_id,("✅ ساختمان ساخته شد." if ok else f"⛔ {res}"),back_kb("menu:development"),section="development")
     elif action == "buildf":
         do_build_factory(chat_id, message_id, user_id, parts[1])
     elif cb_data == "menu:army":
@@ -3491,18 +4438,76 @@ def handle_callback(chat_id, message_id, user_id, username, cb_data, callback_id
         do_diplo_break(chat_id, message_id, user_id, int(parts[1]))
     elif action == "aidstart":
         ask_aid_amount(chat_id, message_id, user_id, int(parts[1]))
+    elif cb_data == "menu:sports":
+        show_sports(chat_id,message_id,user_id)
+    elif action == "sport":
+        if parts[1]=="upgrade": upgrade_sport(chat_id,message_id,user_id,parts[2])
+        elif parts[1]=="match": show_sport_match_targets(chat_id,message_id,user_id,parts[2])
+        elif parts[1]=="play": play_sport_match(chat_id,message_id,user_id,parts[2],int(parts[3]))
+        elif parts[1]=="tournaments": show_sport_tournaments(chat_id,message_id,user_id)
+        elif parts[1]=="tjoin": join_tournament(chat_id,message_id,user_id,int(parts[2]))
+        elif parts[1]=="olympics": show_olympics(chat_id,message_id,user_id)
+        elif parts[1]=="ojoin": join_olympics(chat_id,message_id,user_id,int(parts[2]))
     elif cb_data == "menu:war":
-        show_war_menu(chat_id, message_id, user_id)
+        if war_enabled(): show_war_menu(chat_id, message_id, user_id)
+        else: war_gate(chat_id,message_id)
+    elif action == "atk":
+        if war_enabled(): show_attack_targets(chat_id,message_id,user_id,parts[1],0)
+        else: war_gate(chat_id,message_id)
+    elif action == "atkpage":
+        if war_category_gate(chat_id,message_id,parts[1]):
+            show_attack_targets(chat_id,message_id,user_id,parts[1],int(parts[2]))
+    elif action == "atktsel":
+        at=parts[1]; tid=int(parts[2])
+        cat = "bomb" if at == "fast" else at
+        if not war_category_gate(chat_id,message_id,cat): return
+        if at=="fast": show_fast_bombs(chat_id,message_id,user_id,tid)
+        elif at=="air": show_air_attack_types(chat_id,message_id,user_id,tid)
+        elif at=="ground": render(chat_id,message_id,"🪖 نوع حمله زمینی را انتخاب کن:",kb([[("🏴 فتح",f"groundmode:{tid}:capture")],[("💰 دزدی منابع",f"groundmode:{tid}:steal")],[("🔙 بازگشت","menu:war")]]))
+        elif at=="navy": show_attack_units(chat_id,message_id,user_id,"navy",tid,"blockade")
+    elif action == "fastdo":
+        if not war_category_gate(chat_id,message_id,"bomb"): return
+        ok,res=fast_conquest(require_country(user_id)["id"],int(parts[1]),parts[2])
+        render(chat_id,message_id,("✅ " if ok else "⛔ ")+res,back_kb("menu:war"),section="war")
+        if war_enabled():
+            aa=get_country(user_id and require_country(user_id)["id"]); dd=get_country(int(parts[1]))
+            if aa and dd:
+                channel_text=f"⚡ <b>گزارش تسخیر سریع</b>\n\n🌍 {aa['flag']} {aa['name']} → {dd['flag']} {dd['name']}\n📊 نتیجه: {'موفق' if ok else 'ناموفق'}\n⚔️ {res}"
+                add_news(channel_text,category="war")
+                if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,channel_text)
+    elif action == "groundmode":
+        if not war_category_gate(chat_id,message_id,"ground"): return
+        show_attack_units(chat_id,message_id,user_id,"ground",int(parts[1]),parts[2])
+    elif action == "atkunit":
+        if not war_category_gate(chat_id,message_id,parts[1]): return
+        ask_attack_quantity(chat_id,message_id,user_id,parts[1],int(parts[2]),parts[3],parts[4])
+    elif action == "airmode":
+        if not war_category_gate(chat_id,message_id,"air"): return
+        if parts[2]=="leaders": show_attack_units(chat_id,message_id,user_id,"air",int(parts[1]),"leaders")
+        elif parts[2]=="industry": show_attack_units(chat_id,message_id,user_id,"air",int(parts[1]),"industry")
+        else: show_attack_units(chat_id,message_id,user_id,"air",int(parts[1]),"random")
+    elif action == "break":
+        if not war_category_gate(chat_id,message_id,"navy"): return
+        show_break_blockade(chat_id,message_id,user_id,int(parts[1]))
+    elif action == "breakunit":
+        if not war_category_gate(chat_id,message_id,"navy"): return
+        b=query_one("SELECT * FROM blockades WHERE id=?",(int(parts[1]),))
+        if b:
+            ask_attack_quantity(chat_id,message_id,user_id,"navy",b["defender_id"],parts[2],f"break:{parts[1]}")
     elif action == "warpage":
-        show_war_menu(chat_id, message_id, user_id, int(parts[1]))
-    elif action == "wartarget":
-        confirm_war(chat_id, message_id, user_id, int(parts[1]))
-    elif action == "declarewar":
-        do_declare_war(chat_id, message_id, user_id, int(parts[1]))
-    elif action == "battle":
-        do_battle_round(chat_id, message_id, user_id, int(parts[1]))
+        if war_enabled(): show_war_menu(chat_id, message_id, user_id, int(parts[1]))
+        else: war_gate(chat_id,message_id)
     elif cb_data == "menu:territory":
         show_territory_menu(chat_id, message_id, user_id)
+    elif action == "capturestrait":
+        confirm_capture_strait(chat_id, message_id, user_id, int(parts[1]))
+    elif action == "docapturestrait":
+        do_capture_strait(chat_id, message_id, user_id, int(parts[1]))
+    elif action == "togglestrait":
+        c = require_country(user_id)
+        if c:
+            ok, res = toggle_strait_closure(c["id"], int(parts[1]))
+            render(chat_id, message_id, ("✅ " if ok else "⛔ ") + res, back_kb("menu:territory"), section="territory")
     elif cb_data == "menu:trade":
         show_trade_menu(chat_id, message_id, user_id)
     elif action == "buyres":
@@ -3521,6 +4526,13 @@ def handle_callback(chat_id, message_id, user_id, username, cb_data, callback_id
         show_report(chat_id, message_id, user_id)
     elif cb_data == "menu:settings":
         show_settings(chat_id, message_id, user_id)
+    elif cb_data == "settings:countryinfo":
+        show_country_info_settings(chat_id,message_id,user_id)
+    elif action == "cinfo":
+        if parts[1] == "government": show_government_types(chat_id,message_id,user_id)
+        else: ask_country_info_field(chat_id,message_id,user_id,parts[1])
+    elif action == "gov":
+        set_government_type(chat_id,message_id,user_id,int(parts[1]))
     elif cb_data == "menu:shop":
         show_shop_menu(chat_id, message_id, user_id)
     elif action == "buypack":
@@ -3597,6 +4609,9 @@ def handle_text(chat_id, user_id, username, text):
         else:
             send_country_selection(chat_id, 0)
         return
+    if text.split("@")[0] == "/country":
+        send_message(chat_id, "برای دیدن کشور یک نفر، رو پیامش تو گروه ریپلای کن و /country بفرست.")
+        return
 
     pending = AWAITING.get(user_id)
     if not pending:
@@ -3610,7 +4625,16 @@ def handle_text(chat_id, user_id, username, text):
 
     action = pending["action"]
     try:
-        if action == "buy_unit":
+        if action == "attack_qty":
+            qty=int(text)
+            if qty<=0: raise ValueError
+            if pending["mode"].startswith("break:"):
+                bid=int(pending["mode"].split(":",1)[1])
+                ok,res=break_blockade(user_id,bid,pending["unit_key"],qty)
+                send_message(chat_id,("✅ " if ok else "⛔ ")+res)
+            else:
+                do_attack_quantity(chat_id,user_id,pending,qty)
+        elif action == "buy_unit":
             qty = int(text)
             if qty <= 0:
                 raise ValueError
@@ -3634,6 +4658,14 @@ def handle_text(chat_id, user_id, username, text):
             do_publish_statement(chat_id, user_id, text)
         elif action == "custom_country_name":
             do_custom_country_name(chat_id, user_id, text)
+        elif action == "country_info_field":
+            c=require_country(user_id)
+            field=pending.get("field")
+            if c and field in COUNTRY_INFO_FIELDS:
+                value=text.strip()[:60]
+                execute(f"UPDATE countries SET {field}=? WHERE id=?",(value,c["id"]))
+                send_message(chat_id,f"✅ {COUNTRY_INFO_FIELDS[field]} روی «{value}» تنظیم شد.")
+                show_country_info_settings(chat_id,None,user_id)
         elif action == "un_propose":
             do_un_propose(chat_id, user_id, text)
         elif action == "un_meeting":
@@ -3674,12 +4706,14 @@ def send_admin_panel(chat_id, message_id=None):
     text = "👑 <b>پنل مدیریت</b>\nیکی از بخش‌ها رو انتخاب کن:"
     rows = [
         [("🌍 مدیریت کشورها", "admin:countries"), ("👥 بازیکنان", "admin:players")],
-        [("⚔️ جنگ‌ها", "admin:wars"), ("🤝 روابط/اتحادها", "admin:relations")],
+        [("🤝 روابط/اتحادها", "admin:relations")],
+        [("🏆 مدیریت ورزش", "admin:sports"), ("⚔️ وضعیت جنگ", "admin:warcontrol")],
         [("📰 ارسال خبر", "admin:sendnews"), ("📢 پیام همگانی", "admin:broadcast")],
         [("🎲 رویداد جهانی", "admin:event"), ("📊 آمار بازی", "admin:stats")],
         [("📜 لاگ فعالیت‌ها", "admin:logs"), ("💾 پشتیبان دیتابیس", "admin:backup")],
         [("🎖️ کشورهای ویژه (مالک/ادمین)", "admin:special")],
         [("🖼️ عکس رویدادها", "admin:eventimages")],
+        [("🖼️ عکس بخش‌های منو", "admin:sectionimages")],
         [("🔄 ریست فصل", "admin:resetseason")],
         [("🔙 بازگشت به بازی", "menu:main")],
     ]
@@ -3724,19 +4758,30 @@ def handle_admin_callback(chat_id, message_id, user_id, cb_data):
     elif sub == "setunit":
         cid = int(parts[2])
         rows = []
-        for cat, keys in UNIT_CATEGORIES.items():
-            for k in keys:
-                rows.append([(ALL_UNITS[k]["name"], f"admin:setunit2:{cid}:{k}")])
+        # دسته‌بندی جداگانه تا همه‌ی تجهیزات، مخصوصاً بمب‌ها، از پنل ادمین قابل تنظیم باشند.
+        for cat in ("ground", "air", "navy", "missile", "bomb", "defense"):
+            keys = UNIT_CATEGORIES.get(cat, [])
+            if not keys:
+                continue
+            rows.append([(f"{CATEGORY_FA.get(cat, cat)}", f"admin:setunitcat:{cid}:{cat}")])
         rows.append([("🔙 بازگشت", f"admin:country:{cid}")])
-        render(chat_id, message_id, "کدوم واحد رو تغییر بدم؟ (پیمایش کن)", kb(rows[:25] + rows[-1:]))
+        render(chat_id, message_id, "دسته‌ی تجهیزی که می‌خوای تنظیم کنی رو انتخاب کن:", kb(rows))
+    elif sub == "setunitcat":
+        cid, cat = int(parts[2]), parts[3]
+        if cat not in UNIT_CATEGORIES:
+            render(chat_id, message_id, "دسته نامعتبره.", back_kb(f"admin:country:{cid}"))
+            return
+        rows = []
+        army = get_army(cid)
+        for k in UNIT_CATEGORIES[cat]:
+            qty = army.get(k, 0)
+            rows.append([(f"{ALL_UNITS[k]['name']} — فعلی: {qty}", f"admin:setunit2:{cid}:{k}")])
+        rows.append([("🔙 بازگشت", f"admin:setunit:{cid}")])
+        render(chat_id, message_id, f"تنظیم {CATEGORY_FA.get(cat, cat)} برای این کشور:", kb(rows))
     elif sub == "setunit2":
         cid, key = int(parts[2]), parts[3]
         AWAITING[user_id] = {"action": "admin_setunit", "country_id": cid, "unit_key": key, "chat_id": chat_id}
         render(chat_id, message_id, f"تعداد جدید {ALL_UNITS[key]['name']} رو بفرست:", back_kb(f"admin:country:{cid}"))
-    elif sub == "sethp":
-        cid = int(parts[2])
-        AWAITING[user_id] = {"action": "admin_sethp", "country_id": cid, "chat_id": chat_id}
-        render(chat_id, message_id, "مقدار جدید سلامت کشور (HP) رو بفرست:", back_kb(f"admin:country:{cid}"))
     elif sub == "delete":
         cid = int(parts[2])
         execute("UPDATE countries SET active=0, owner_id=NULL WHERE id=?", (cid,))
@@ -3757,12 +4802,58 @@ def handle_admin_callback(chat_id, message_id, user_id, cb_data):
         uid = int(parts[2])
         execute("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
         render(chat_id, message_id, "✅ کاربر آن‌بن شد.", back_kb(f"admin:player:{uid}"))
-    elif sub == "wars":
-        show_wars_admin(chat_id, message_id)
-    elif sub == "endwar":
-        wid = int(parts[2])
-        end_war(wid, "draw")
-        render(chat_id, message_id, "✅ جنگ به‌صورت مساوی پایان یافت.", back_kb("admin:wars"))
+    elif sub == "sports":
+        show_sports_admin(chat_id, message_id)
+    elif sub == "sportcreate":
+        create_sport_tournament_prompt(chat_id,user_id,parts[2])
+    elif sub == "olympiccreate":
+        execute("INSERT INTO olympics(name,status,created_at) VALUES(?,?,?)",("المپیک جهانی","registration",now()))
+        oid=_conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        msg="🏅 <b>ثبت‌نام المپیک جهانی آغاز شد!</b>\n\nتمام ۶ رشته: ⚽ 🏀 🏐 🎾 🥊 🤼\n\n🌍 کشورها می‌توانند از بخش ورزش عضو شوند."
+        add_news(msg,category="sports")
+        if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,msg)
+        render(chat_id,message_id,f"✅ المپیک #{oid} ساخته شد و ثبت‌نام شروع شد.",back_kb("admin:sports"))
+    elif sub == "olympicstart":
+        start_olympics(chat_id,message_id,user_id)
+    elif sub == "tstart":
+        tid=int(parts[2]); t=query_one("SELECT * FROM sports_tournaments WHERE id=?",(tid,))
+        if not t:
+            render(chat_id,message_id,"❌ تورنومنت پیدا نشد.",back_kb("admin:sports"))
+        elif t["status"]!="registration":
+            render(chat_id,message_id,"❌ این تورنومنت در مرحله ثبت‌نام نیست.",back_kb("admin:sports"))
+        else:
+            execute("UPDATE sports_tournaments SET status='active',started_at=? WHERE id=?",(now(),tid))
+            msg=f"🏆 <b>تورنومنت {SPORTS[t['sport_key']]} شروع شد!</b>\n\n📛 {t['name']}\n🌍 مسابقات کشورهای ثبت‌نام‌شده آغاز شد."
+            add_news(msg,category="sports")
+            if NEWS_CHANNEL: send_to_channel(NEWS_CHANNEL,msg)
+            render(chat_id,message_id,msg,back_kb("admin:sports"))
+    elif sub == "tfinish":
+        run_sport_tournament(chat_id,message_id,int(parts[2]))
+    elif sub == "warcontrol":
+        status="🟢 فعال" if war_enabled() else "🔴 غیرفعال"
+        lines=[f"⚔️ <b>کنترل جنگ</b>", f"جنگ کلی: {status}", "", "وضعیت دسته‌ها:"]
+        rows=[]
+        for cat in ("ground","air","bomb","navy"):
+            st="🟢 فعال" if war_category_enabled(cat) else "🔴 غیرفعال"
+            lines.append(f"{WAR_CATEGORY_FA[cat]}: {st}")
+            rows.append([(f"{'🔴 غیرفعال کردن' if war_category_enabled(cat) else '🟢 فعال کردن'} {WAR_CATEGORY_FA[cat]}", f"admin:warcat:{cat}")])
+        rows.extend([[ ("🟢 فعال‌سازی همه جنگ‌ها","admin:waron") ],[("🔴 غیرفعال‌سازی همه جنگ‌ها","admin:waroff")],[("🔙 بازگشت","admin:main")]])
+        render(chat_id,message_id,"\n".join(lines),kb(rows))
+    elif sub == "warcat":
+        cat=parts[2] if len(parts)>2 else ""
+        if cat not in WAR_CATEGORY_META:
+            render(chat_id,message_id,"⛔ دسته جنگ نامعتبر است.",back_kb("admin:warcontrol"))
+        else:
+            new_state=not war_category_enabled(cat)
+            set_war_category_enabled(cat,new_state)
+            render(chat_id,message_id,f"{'🟢' if new_state else '🔴'} {WAR_CATEGORY_FA[cat]} {'فعال شد' if new_state else 'غیرفعال شد'}.",back_kb("admin:warcontrol"))
+    elif sub == "waron":
+        set_war_enabled(True)
+        for cat in WAR_CATEGORY_META: set_war_category_enabled(cat, True)
+        render(chat_id,message_id,"🟢 همه دسته‌های جنگ فعال شدند.",back_kb("admin:warcontrol"))
+    elif sub == "waroff":
+        set_war_enabled(False)
+        render(chat_id,message_id,"🔴 همه جنگ‌ها غیرفعال شدند.",back_kb("admin:warcontrol"))
     elif sub == "relations":
         show_relations_admin(chat_id, message_id, int(parts[2]) if len(parts) > 2 else 0)
     elif sub == "sendnews":
@@ -3784,13 +4875,16 @@ def handle_admin_callback(chat_id, message_id, user_id, cb_data):
         show_special_countries_admin(chat_id, message_id)
     elif sub == "eventimages":
         show_event_images_admin(chat_id, message_id)
+    elif sub == "sectionimages":
+        show_section_images_admin(chat_id, message_id)
     elif sub == "setimg":
         category = parts[2]
         AWAITING[user_id] = {"action": "admin_set_event_image", "category": category, "chat_id": chat_id}
+        back_target = "admin:eventimages" if category in EVENT_IMAGE_CATEGORIES else "admin:sectionimages"
         render(chat_id, message_id,
-                 f"یک عکس بفرست یا لینک (URL) عکس رو بفرست که برای «{EVENT_IMAGE_CATEGORIES[category]}» استفاده بشه.\n"
+                 f"یک عکس بفرست یا لینک (URL) عکس رو بفرست که برای «{ALL_IMAGE_CATEGORIES[category]}» استفاده بشه.\n"
                  "برای پاک‌کردن عکس فعلی، کلمه‌ی «حذف» رو بفرست.",
-                 back_kb("admin:eventimages"))
+                 back_kb(back_target))
     elif sub == "payapprove":
         approve_manual_payment(chat_id, int(parts[2]))
     elif sub == "payreject":
@@ -3818,12 +4912,28 @@ def show_event_images_admin(chat_id, message_id):
     render(chat_id, message_id, "\n".join(lines), kb(rows))
 
 
+def show_section_images_admin(chat_id, message_id):
+    lines = [
+        "🖼️ <b>عکس بخش‌های منو</b>\n"
+        "برای هر بخش می‌تونی یک عکس تنظیم کنی؛ از این به بعد هر وقت بازیکنی وارد اون بخش بشه،"
+        " به‌جای پیام متنیِ ساده، همون عکس همراه با توضیحات براش فرستاده می‌شه.\n"
+    ]
+    rows = []
+    for cat, label in SECTION_IMAGE_CATEGORIES.items():
+        current = get_event_image(cat)
+        status = "✅ تنظیم شده" if current else "❌ تنظیم نشده"
+        lines.append(f"{label}: {status}")
+        rows.append([(f"🖼️ {label}", f"admin:setimg:{cat}")])
+    rows.append([("🔙 بازگشت", "admin:main")])
+    render(chat_id, message_id, "\n".join(lines), kb(rows))
+
+
 def handle_admin_photo(chat_id, user_id, pending, file_id):
     category = pending.get("category")
-    if not category or category not in EVENT_IMAGE_CATEGORIES:
+    if not category or category not in ALL_IMAGE_CATEGORIES:
         return
     set_event_image(category, file_id)
-    send_message(chat_id, f"✅ عکس برای «{EVENT_IMAGE_CATEGORIES[category]}» ذخیره شد.")
+    send_message(chat_id, f"✅ عکس برای «{ALL_IMAGE_CATEGORIES[category]}» ذخیره شد.")
 
 
 def show_special_countries_admin(chat_id, message_id):
@@ -3869,13 +4979,12 @@ def show_country_admin(chat_id, message_id, cid):
         f"{c['flag']} <b>{c['name']}</b> (#{c['id']})\n"
         f"مالک: {owner_txt}\n"
         f"خزانه: {fmt_num(c['treasury'])}\n"
-        f"HP: {fmt_num(c['hp'])}/{fmt_num(c['max_hp'])}\n"
         f"وضعیت: {'فعال' if c['active'] else 'غیرفعال'}"
     )
     rows = [
         [("👤 تغییر مالک", f"admin:transfer:{cid}"), ("🆓 آزاد کردن", f"admin:free:{cid}")],
         [("💰 تنظیم خزانه", f"admin:settreasury:{cid}"), ("⛏️ تنظیم منابع", f"admin:setres:{cid}")],
-        [("🪖 تنظیم ارتش", f"admin:setunit:{cid}"), ("❤️ تنظیم HP", f"admin:sethp:{cid}")],
+        [("🪖 تنظیم ارتش", f"admin:setunit:{cid}"), ("☢️ تنظیم بمب‌ها", f"admin:setunitcat:{cid}:bomb")],
     ]
     if c["active"]:
         rows.append([("🗑️ غیرفعال‌سازی", f"admin:delete:{cid}")])
@@ -3927,21 +5036,6 @@ def show_player_admin(chat_id, message_id, uid):
     render(chat_id, message_id, text, kb(rows))
 
 
-def show_wars_admin(chat_id, message_id):
-    wars = query("SELECT * FROM wars WHERE status='active'")
-    lines = ["⚔️ جنگ‌های فعال:\n"]
-    rows = []
-    for w in wars:
-        a = get_country(w["attacker_id"])
-        d = get_country(w["defender_id"])
-        lines.append(f"#{w['id']}: {a['flag']}{a['name']} ⚔️ {d['flag']}{d['name']}")
-        rows.append([(f"⛔ پایان جنگ #{w['id']}", f"admin:endwar:{w['id']}")])
-    if not wars:
-        lines.append("جنگ فعالی وجود نداره.")
-    rows.append([("🔙 بازگشت", "admin:main")])
-    render(chat_id, message_id, "\n".join(lines), kb(rows))
-
-
 def show_relations_admin(chat_id, message_id, page=0):
     rels = query("SELECT * FROM relations WHERE status != 'neutral'")
     per_page = 12
@@ -3971,7 +5065,6 @@ def show_stats_admin(chat_id, message_id):
         f"کشورهای دارای بازیکن: {taken}\n"
         f"تعداد کاربران: {users_n}\n"
         f"مجموع خزانه‌ی همه‌ی کشورها: {fmt_num(total_treasury)}\n"
-        f"جنگ‌های فعال: {active_wars} (مجموع تاریخی: {total_wars})\n"
         f"مجموع کارخانه‌های ساخته‌شده: {factories}\n"
     )
     render(chat_id, message_id, text, back_kb("admin:main"))
@@ -3992,12 +5085,7 @@ def do_backup(chat_id, message_id):
     backup_dir = os.path.dirname(os.path.abspath(DB_PATH))
     backup_path = os.path.join(backup_dir, f"backup_{ts}.db")
     try:
-        with _lock:
-            dst = sqlite3.connect(backup_path)
-            try:
-                _conn.backup(dst)
-            finally:
-                dst.close()
+        shutil.copy2(DB_PATH, backup_path)
         render(chat_id, message_id, f"✅ پشتیبان دائمی ذخیره شد: {backup_path}", back_kb("admin:main"))
     except Exception as e:
         render(chat_id, message_id, f"⛔ خطا در پشتیبان‌گیری: {e}", back_kb("admin:main"))
@@ -4007,14 +5095,13 @@ def do_reset_season():
     """فصل جدید: همه‌ی کشورها آزاد می‌شن و آمار/دارایی‌ها صفر می‌شه؛ خود کشورها و ساختار دیتابیس دست نمی‌خوره."""
     execute("UPDATE users SET country_id=NULL")
     execute(
-        "UPDATE countries SET owner_id=NULL, treasury=50000, hp=max_hp, wins=0, losses=0, "
+        "UPDATE countries SET owner_id=NULL, treasury=50000, wins=0, losses=0, "
         "conquests=0, debt=0, satisfaction=60, morale=70, tax_rate=0.20"
     )
     execute("DELETE FROM army")
     execute("DELETE FROM factories")
     execute("DELETE FROM tech")
     execute("DELETE FROM research_queue")
-    execute("UPDATE wars SET status='ended' WHERE status='active'")
     execute("UPDATE relations SET status='neutral'")
     execute("UPDATE territories SET owner_id = original_owner_id WHERE is_strait=0")
     execute("UPDATE territories SET owner_id=NULL WHERE is_strait=1")
@@ -4031,7 +5118,7 @@ def handle_admin_text(chat_id, user_id, action, pending, text):
                 send_message(chat_id, "✅ عکس حذف شد.")
             else:
                 set_event_image(category, text.strip())
-                send_message(chat_id, f"✅ عکس برای «{EVENT_IMAGE_CATEGORIES[category]}» ذخیره شد.")
+                send_message(chat_id, f"✅ عکس برای «{ALL_IMAGE_CATEGORIES[category]}» ذخیره شد.")
         elif action == "admin_transfer":
             new_owner = int(text)
             execute("UPDATE countries SET owner_id=? WHERE id=?", (new_owner, cid))
@@ -4059,13 +5146,14 @@ def handle_admin_text(chat_id, user_id, action, pending, text):
                 (cid, key, qty, qty),
             )
             send_message(chat_id, "✅ تعداد واحد نظامی به‌روزرسانی شد.")
-        elif action == "admin_sethp":
-            hp = float(text)
-            execute("UPDATE countries SET hp=? WHERE id=?", (hp, cid))
-            send_message(chat_id, "✅ HP به‌روزرسانی شد.")
         elif action == "admin_sendnews":
             add_news(f"📢 {text}")
             send_message(chat_id, "✅ خبر منتشر شد.")
+        elif action == "admin_sport_tournament_name":
+            name=text.strip()[:60]
+            if not name: raise ValueError
+            tid=create_sport_tournament(user_id,pending["sport_key"],name)
+            send_message(chat_id,f"✅ تورنومنت #{tid} ساخته شد و ثبت‌نام کشورها آغاز شد.")
         elif action == "admin_broadcast":
             users = query("SELECT user_id FROM users")
             for u in users:
@@ -4101,6 +5189,7 @@ def background_loop():
             now = int(time.time())
             if now - last_tick >= TICK_INTERVAL_SECONDS:
                 economic_tick()
+                check_protests()
                 collect_finished_research()
                 import random
                 if random.random() < 0.15:  # حدود ۱۵٪ احتمال رویداد در هر تیک
@@ -4148,6 +5237,12 @@ def process_update(update):
                 return
             text = msg.get("text", "")
             if text:
+                cmd = text.strip().split("@")[0]
+                if cmd == "/country" and msg.get("reply_to_message"):
+                    reply_from = msg["reply_to_message"].get("from")
+                    if reply_from:
+                        show_country_lookup(chat_id, reply_from["id"])
+                        return
                 handle_text(chat_id, user_id, username, text)
     except Exception:
         print("[process_update] خطا در پردازش آپدیت:")
@@ -4172,6 +5267,7 @@ def main():
     seed_countries_if_needed()
     ensure_special_and_vip_countries()
     sync_country_flags()
+    ensure_default_section_images()
     print("دیتابیس آماده است. شروع polling ...")
 
     t = threading.Thread(target=background_loop, daemon=True)
